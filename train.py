@@ -57,7 +57,7 @@ parser.add_argument('--num_test', default=100000, type=int,
 # DataLoader
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('-b', '--batch_size', default=16, type=int, metavar='N',
+parser.add_argument('-b', '--batch-size', default=16, type=int, metavar='N',
                     help='mini-batch size (default: 16)'
                          '[kobert] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50'
                          '[kogpt2] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50'
