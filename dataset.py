@@ -13,7 +13,7 @@ def num2code(num, digits=None):
     code = '0'*(digits-len(num)) + num
     return code
 
-def preprocess(frame, clean_fn=None):
+def preprocess(frame, augmentation=False, clean_fn=None):
         """
         input
             - frame : '대분류', '중분류', '소분류', text_obj', 'text_mthd', 'text_deal' 컬럼을 포함하는 데이터프레임
@@ -24,11 +24,21 @@ def preprocess(frame, clean_fn=None):
             - id2cat[Dict] : id(int)를 key로, tuple(대분류, 중분류, 소분류)를 값으로 가지는 사전 객체
         """
         
+        def _augmentation(frame):
+            ~~~~~
+            return frame
+            
+        # 0. augmentation
+        if augmentation:
+            frame = augmentation(frame)
+            
         # 1. doc
         frame[['text_obj', 'text_mthd', 'text_deal']] = frame[['text_obj', 'text_mthd', 'text_deal']].fillna('')
         if clean_fn: # text 전처리 함수
             frame[['text_obj', 'text_mthd', 'text_deal']] = frame[['text_obj', 'text_mthd', 'text_deal']].apply(clean_fn)
         doc: pd.Series = frame[['text_obj', 'text_mthd', 'text_deal']].apply(lambda x: ' '.join(x), axis=1)
+        
+        
         
         # 2. label
         frame['digit_2'] = frame['digit_2'].apply(lambda x: num2code(x, 2)) # 중분류를 2자리 코드값으로 변환
