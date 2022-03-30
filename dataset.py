@@ -71,6 +71,45 @@ def train_test_split(doc, label, test_ratio=0.1, seed=42):
             test = pd.concat([test, temp_df_l.iloc[:slice_idx, :]])
     return train['doc'].to_list(), train['label'].to_list(), test['doc'].to_list(), test['label'].to_list()
             
+class EnsembleDataset(Dataset):
+    def __init__(self, doc, label, kobert_tokenizer, max_len=50, padding='max_length', truncation=True):
+        super(EnsembleDataset, self).__init__()
+        self.doc = doc
+        
+        self.kobert_tokenizer = kobert_tokenizer
+        self.kogpt_tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                                'skt/kogpt2-base-v2',
+                                bos_token='</s>', eos_token='</s>', unk_token='<unk>',
+                                pad_token='<pad>', mask_token='<mask>')
+        self.kobert_tokenized = [self.kobert_tokenizer([d]) for d in doc] # numpy.array
+        self.kogpt_toknized = self.kogpt_tokenizer(doc, padding=padding, max_length=max_len, truncation=truncation, return_tensors='pt')
+        self.label = label
+        
+    def gen_attention_mask(self, token_ids, valid_length):
+        attention_mask = np.zeros_like(token_ids)
+        attention_mask[:valid_length] = 1
+        return attention_mask
+    
+    def __getitem__(self, idx):
+        kobert_token_ids = self.kobert_tokenized[idx][0]
+        kobert_valid_length = self.kobert_tokenized[idx][1]
+        kobert_token_type_ids = self.kobert_tokenized[idx][2]
+        kobert_attention_mask = self.gen_attention_mask(kobert_token_ids, kobert_valid_length)
+        
+        kogpt_token_ids = self.kogpt_toknized.input_ids[idx]
+        kogpt_attention_mask = self.kogpt_toknized.attention_mask[idx]
+        kogpt_token_type_ids = self.kogpt_toknized.token_type_ids[idx]
+        
+        return (torch.cat([torch.from_numpy(kobert_token_ids).unsqueeze(0), kogpt_token_ids.unsqueeze(0)], dim=0), # token_ids
+                torch.cat([torch.from_numpy(kobert_attention_mask).unsqueeze(0), kogpt_attention_mask.unsqueeze(0)], dim=0), # attention_mask
+                torch.cat([torch.from_numpy(kobert_token_type_ids).unsqueeze(0), kogpt_token_type_ids.unsqueeze(0)], dim=0), # token_type_ids
+                self.label[idx]) # int scalar
+
+    def __len__(self):
+        return (len(self.label))
+        
+        
+        
 class KOBERTClassifyDataset(Dataset):
     def __init__(self, doc, label, tokenizer):
         super(KOBERTClassifyDataset, self).__init__()

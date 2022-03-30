@@ -33,8 +33,8 @@ print('transformers ver:', transformers.__version__)
 
 from loss import CrossEntropy, FocalCrossEntropy, label2target
 from utils import create_logger, create_directory, increment_path, save_performance_graph
-from dataset import preprocess, train_test_split, KOGPT2ClassifyDataset, KOGPT3ClassifyDataset, KOBERTClassifyDataset
-from network import KOGPT2Classifier, KOGPT3Classifier, KOBERTClassifier
+from dataset import preprocess, train_test_split, KOGPT2ClassifyDataset, KOGPT3ClassifyDataset, KOBERTClassifyDataset, EnsembleDataset
+from network import KOGPT2Classifier, KOGPT3Classifier, KOBERTClassifier, EnsembleClassifier
 
 FILE = Path(__file__).resolve()
 DATA = FILE.parents[2]
@@ -64,8 +64,8 @@ parser.add_argument('-b', '--batch-size', default=16, type=int, metavar='N',
                          '[kogpt3] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50')
 
 # Model
-parser.add_argument('-m', '--model', default='kogpt3', type=str,
-                    help='Model to train. Available models are ["kobert", "kogpt2", "kogpt3"]. default is "kogpt3".')
+parser.add_argument('-m', '--model', default='kobert', type=str,
+                    help='Model to train. Available models are ["kobert", "kogpt2", "kogpt3", "ensemble"]. default is "kogpt3".')
 
 # Train setting
 parser.add_argument('--epochs', default=10, type=int, metavar='N',
@@ -339,7 +339,7 @@ def get_model_dataset(model_type, root, num_test, max_len, seed):
         train_set = KOBERTClassifyDataset(doc_train, label_train, transform)
         test_set = KOBERTClassifyDataset(doc_test, label_test, transform)
         
-        model = KOBERTClassifier(kobert, num_classes=len(cat2id.keys()))
+        model = KOBERTClassifier(kobert, num_classes=num_classes)
         return model, train_set, test_set
     
     def _get_kogpt2_model_dataset(num_classes, doc_train, label_train, doc_test, label_test, max_len):
@@ -354,6 +354,21 @@ def get_model_dataset(model_type, root, num_test, max_len, seed):
         test_set = KOGPT3ClassifyDataset(doc_test, label_test, max_len=max_len, padding='max_length', truncation=True)
         
         model = KOGPT3Classifier(num_classes=num_classes, pad_token_id = train_set.tokenizer.eos_token_id)
+        return model, train_set, test_set
+    
+    def _get_ensemble_model_dataset(num_classes, doc_train, label_train, doc_test, label_test, max_len):
+        kobert, vocab = get_pytorch_kobert_model()
+        tokenizer_path = get_tokenizer()
+        tokenizer = nlp.data.BERTSPTokenizer(tokenizer_path, vocab, lower=False)
+        transform = nlp.data.BERTSentenceTransform(
+                    tokenizer, max_seq_length=max_len, pad=True, pair=False) 
+        
+        train_set = EnsembleDataset(doc_train, label_train, kobert_tokenizer=transform, max_len=max_len, padding='max_length', truncation=True)
+        test_set = EnsembleDataset(doc_test, label_test, kobert_tokenizer=transform, max_len=max_len, padding='max_length', truncation=True)
+        
+        kobert = KOBERTClassifier(kobert, num_classes=num_classes)
+        kogpt2 = KOGPT2Classifier(num_classes=num_classes, pad_token_id = train_set.kogpt_tokenizer.eos_token_id)
+        model = EnsembleClassifier(kogpt2, kobert, num_classes=num_classes)
         return model, train_set, test_set
     
     try:
@@ -371,6 +386,8 @@ def get_model_dataset(model_type, root, num_test, max_len, seed):
         return _get_kogpt2_model_dataset(num_classes, doc_train, label_train, doc_test, label_test, max_len), cat2id, id2cat
     elif model_type=='kogpt3':
         return _get_kogpt3_model_dataset(num_classes, doc_train, label_train, doc_test, label_test, max_len), cat2id, id2cat
+    elif model_type=='ensemble':
+        return _get_ensemble_model_dataset(num_classes, doc_train, label_train, doc_test, label_test, max_len), cat2id, id2cat
     else:
         raise
         

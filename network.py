@@ -1,8 +1,53 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import BertModel, GPTJForCausalLM, GPT2LMHeadModel
 from kobert.pytorch_kobert import get_pytorch_kobert_model
 
+class EnsembleClassifier(nn.Module):
+    """ https://discuss.pytorch.org/t/custom-ensemble-approach/52024/8 """
+    def __init__(self, kogpt2, kobert, num_classes=225, hidden_size=4026):
+        super(EnsembleClassifier, self).__init__()
+        self.kogpt2 = kogpt2
+        self.kobert = kobert
+        self.num_classes = num_classes
+        
+        # Create new classifier
+        self.classifier = nn.Sequential(nn.Linear(768+768, hidden_size),
+                                        nn.ReLU(),
+                                        nn.Linear(hidden_size, num_classes))
+        
+        # Remove last linear layer
+        self.kogpt2.classifier = nn.Identity()
+        self.kobert.classifier = nn.Identity()
+        
+        for child in self.kogpt2.children():
+            for param in child.parameters():
+                param.requires_grad = False
+                
+        for child in self.kobert.children():
+            for param in child.parameters():
+                param.requires_grad = False
+        
+    def forward(self, token_ids, attention_mask, token_type_ids):
+        # kogpt2 output
+        x1 = self.kogpt2.gpt.transformer(input_ids=token_ids.clone()[:,1],
+                                  token_type_ids=token_type_ids.clone()[:,1],
+                                  attention_mask = attention_mask.clone()[:,1])
+        x1 = x1.last_hidden_state[:, -1].contiguous()
+        x1 = x1.view(x1.size(0), -1)
+        
+        # kobert output
+        _, x2 = self.kobert.bert(input_ids=token_ids[:,0],
+                          token_type_ids=token_type_ids.long()[:,0],
+                          attention_mask=attention_mask.float()[:,0])
+        x2 = x2.view(x2.size(0), -1)
+        
+        x = torch.cat((x1, x2), dim=1)
+        x = self.classifier(F.relu(x))
+        return x
+
+    
 class KOBERTClassifier(nn.Module):
     def __init__(self, bert, num_classes, hidden_size = 768, dr_rate=None, params=None):
         super(KOBERTClassifier, self).__init__()
