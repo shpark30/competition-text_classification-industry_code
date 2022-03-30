@@ -2,6 +2,7 @@ import os
 import argparse
 import pandas as pd
 from tqdm import tqdm
+from pathlib import Path
 
 from network import *
 from dataset import *
@@ -58,7 +59,7 @@ if __name__=='__main__':
     FILE = Path(__file__).resolve()
     DATA = FILE.parents[2]
     ROOT = FILE.parents[0]  # root directory
-    save_dir = increment_path(Path(ROOT) / 'runs' / 'inference' / 'exp', exist_ok=opt.exist_ok)
+    save_dir = increment_path(Path(ROOT) / 'runs' / 'inference' / 'exp')
     
     parser=argparse.ArgumentParser(
         description='')
@@ -70,7 +71,7 @@ if __name__=='__main__':
     
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                         help='number of data loading workers (default: 4)')
-    parser.add_argument('-b', '--batch_size', default=16, type=int, metavar='N',
+    parser.add_argument('-b', '--batch-size', default=16, type=int, metavar='N',
                         help='mini-batch size (default: 16)'
                              '[kobert] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50'
                              '[kogpt2] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50'
