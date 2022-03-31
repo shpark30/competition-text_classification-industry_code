@@ -71,7 +71,7 @@ def save_performance_graph(summary_path, save_path):
     ax2.legend(loc='best', fontsize=20, frameon=True, shadow=True)
 
     plt.savefig(save_path, dpi=50)
-    plt.figure().close()
+    del fig
         
         
 if __name__=='__main__':

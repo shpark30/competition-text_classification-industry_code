@@ -38,7 +38,7 @@ class EnsembleClassifier(nn.Module):
         x1 = x1.view(x1.size(0), -1)
         
         # kobert output
-        _, x2 = self.kobert.bert(input_ids=token_ids[:,0],
+        _, x2 = self.kobert.bert(input_ids=token_ids.long()[:,0],
                           token_type_ids=token_type_ids.long()[:,0],
                           attention_mask=attention_mask.float()[:,0])
         x2 = x2.view(x2.size(0), -1)
@@ -66,7 +66,7 @@ class KOBERTClassifier(nn.Module):
 #         return attention_mask.float()
 
     def forward(self, token_ids, attention_mask, token_type_ids):
-        _, pooler = self.bert(input_ids=token_ids,
+        _, pooler = self.bert(input_ids=token_ids.long(),
                               token_type_ids=token_type_ids.long(),
                               attention_mask=attention_mask.float())
         if self.dr_rate:

@@ -13,7 +13,7 @@ def num2code(num, digits=None):
     code = '0'*(digits-len(num)) + num
     return code
 
-def preprocess(frame, clean_fn=None):
+def preprocess(frame, clean_fn=None, target='S'):
         """
         input
             - frame : '대분류', '중분류', '소분류', text_obj', 'text_mthd', 'text_deal' 컬럼을 포함하는 데이터프레임
@@ -35,18 +35,44 @@ def preprocess(frame, clean_fn=None):
         frame['digit_3'] = frame['digit_3'].apply(lambda x: num2code(x, 3)) # 소분류를 3자리 코드값으로 변환
         
             # 훈련 데이터에 있는 유니크한 분류값
-        unique_categories = frame[['digit_1', 'digit_2', 'digit_3']].drop_duplicates().apply(lambda x: tuple(x), axis=1).sort_values().to_list()
-        
-            # 카테고리 별 아이디 부여, 아이디로 카테고리 값 반환
-        cat2id, id2cat = {}, {}
-        for i, cat in enumerate(unique_categories):
-            cat2id[cat[-1]] = i
-            id2cat[i] = cat
+        if target == 'S':
+            unique_categories = frame[['digit_1', 'digit_2', 'digit_3']].drop_duplicates().apply(lambda x: tuple(x), axis=1).sort_values().to_list()
+
+                # 카테고리 별 아이디 부여, 아이디로 카테고리 값 반환
+            cat2id, id2cat = {}, {}
+            for i, cat in enumerate(unique_categories):
+                cat2id[cat[-1]] = i
+                id2cat[i] = cat
+            label: pd.Series = frame['digit_3'].apply(lambda x: cat2id[x])
+                
+        elif target == 'M':
+            unique_categories = frame['digit_2'].drop_duplicates().sort_values().to_list()
+            cat2id, id2cat = {}, {}
+            for i, cat in enumerate(unique_categories):
+                cat2id[cat] = i
+                id2cat[i] = cat
+            label: pd.Series = frame['digit_1'].apply(lambda x: cat2id[x])
+                
+        elif target == 'L':
+            unique_categories = frame['digit_1'].drop_duplicates().sort_values().to_list()
+            cat2id, id2cat = {}, {}
+            for i, cat in enumerate(unique_categories):
+                cat2id[cat] = i
+                id2cat[i] = cat
+            label: pd.Series = frame['digit_1'].apply(lambda x: cat2id[x])
             
-        label: pd.Series = frame['digit_3'].apply(lambda x: cat2id[x])
         return doc.to_list(), label.to_list(), cat2id, id2cat
     
-
+def augmentation(data):
+    c1=data.groupby('digit').sample(frac=1).reset_index(drop=True)[['text_obj','digit']]
+    c2=data.groupby('digit').sample(frac=1).reset_index(drop=True)[['text_mthd','digit']]
+    c3=data.groupby('digit').sample(frac=1).reset_index(drop=True)[['text_deal','digit']]
+    c_total=pd.DataFrame(c1)
+    c_total=pd.concat([c_total,c2,c3],axis=1,ignore_index = True)
+    c_total=c_total.drop([1,3],axis=1)
+    c_total.columns=['text_obj','text_mthd','text_deal','digit']
+    c_total
+    
 def train_test_split(doc, label, test_ratio=0.1, seed=42):
     """
     temp_df 
