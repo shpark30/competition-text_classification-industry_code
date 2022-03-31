@@ -49,7 +49,7 @@ def save_performance_graph(summary_path, save_path):
     ax1.plot(data['epoch'], data['train loss'], label='train')
     ax1.plot(data['epoch'], data['valid loss'], label='valid')
     ax1.axvline(best_epoch, color='lightgray', linestyle='--', linewidth=2,
-               label=f'best loss epoch: {best_epoch}')
+               label=f'best epoch: {best_epoch}')
     ax1.set_xlabel('epoch', size=20)
     ax1.set_ylabel('loss', size=20)
     ax1.tick_params (axis = 'x', labelsize =15)
@@ -63,7 +63,7 @@ def save_performance_graph(summary_path, save_path):
     ax2.plot(data['epoch'], data['recall'], label='recall')
     ax2.plot(data['epoch'], data['f1score'], label='f1score')
     ax2.axvline(best_epoch, color='lightgray', linestyle='--', linewidth=2,
-               label=f'best loss epoch: {best_epoch}')
+               label=f'best epoch: {best_epoch}')
     ax2.set_xlabel('epoch', size=20)
     ax2.set_ylabel('loss', size=20)
     ax2.tick_params (axis = 'x', labelsize =15)
@@ -71,6 +71,7 @@ def save_performance_graph(summary_path, save_path):
     ax2.legend(loc='best', fontsize=20, frameon=True, shadow=True)
 
     plt.savefig(save_path, dpi=50)
+    plt.figure().close()
         
         
 if __name__=='__main__':

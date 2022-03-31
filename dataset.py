@@ -59,9 +59,9 @@ def train_test_split(doc, label, test_ratio=0.1, seed=42):
             train = pd.concat([train, temp_df_l])
         else:
             if len(temp_df_l) <= 5:
-                slice_idx = -1
+                slice_idx = 1
             elif len(temp_df_l) <= 10:
-                slice_idx = -2
+                slice_idx = 2
             elif len(temp_df_l) < 100:
                 a, b = 8/90, 10/9
                 slice_idx = int(a*len(temp_df_l) + b)
