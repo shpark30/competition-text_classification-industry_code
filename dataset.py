@@ -1,6 +1,7 @@
 #시도 
 import pandas as pd
 import numpy as np
+import random
 from typing import Optional, Union, List
 
 import torch
@@ -13,7 +14,97 @@ def num2code(num, digits=None):
     code = '0'*(digits-len(num)) + num
     return code
 
-def preprocess(frame, clean_fn=None, target='S'):
+def upsample_corpus(df, frac=0.1, seed=42):
+    random.seed(seed)
+    s1=random.randrange(0, 1000) # seed 1
+    s2=random.randrange(0, 1000) # seed 2
+    s3=random.randrange(0, 1000) # seed 3
+    sampled_obj = df.groupby('label').sample(frac=frac,random_state=s1).reset_index(drop=True)[['label', 'text_obj']]
+    sampled_mthd = df.groupby('label').sample(frac=frac,random_state=s2).reset_index(drop=True)[['label', 'text_mthd']]
+    sampled_deal = df.groupby('label').sample(frac=frac,random_state=s3).reset_index(drop=True)[['label', 'text_deal']]
+    sampled = pd.concat([sampled_obj,
+                         sampled_mthd['text_mthd'],
+                         sampled_deal['text_deal']], axis=1)
+    upsampled = pd.concat([df[['label', 'text_obj', 'text_mthd', 'text_deal']], sampled])
+    upsampled = upsampled.reset_index(drop=True)
+    return upsampled
+
+def train_test_split(frame, test_ratio=0.1, seed=42):
+    """
+    temp_df 
+    """
+    train, test = pd.DataFrame(), pd.DataFrame()
+    for lb in frame['label'].unique():
+        # (lb) 카테고리의 데이터 순서 섞기
+        temp_df_l = frame[frame['label']==lb].sample(frac=1, random_state=seed).reset_index(drop=True)
+        
+        # 데이터 나누기
+        if len(temp_df_l) < 3:
+            # 데이터 수가 3개 미만인 카테고리는 모두 훈련 데이터로 활용한다. 
+            train = pd.concat([train, temp_df_l])
+        else:
+            # train과 test를 slice할 index 구하기
+            if len(temp_df_l) <= 5:
+                slice_idx = 1
+            elif len(temp_df_l) <= 10:
+                slice_idx = 2
+            elif len(temp_df_l) < 100:
+                a, b = 8/90, 10/9
+                slice_idx = int(a*len(temp_df_l) + b)
+            else: # len(ttemp) >= 100
+                slice_idx = int(len(temp_df_l)*test_ratio)
+                
+            # train, test 나누기
+            train = pd.concat([train, temp_df_l.iloc[slice_idx:, :]])
+            test = pd.concat([test, temp_df_l.iloc[:slice_idx, :]])
+            
+    return train, test
+
+def preprocess(frame, test_ratio=0.1, upsample=False, clean_fn=None, target='S', seed=42):
+        """
+        input
+            - frame : '대분류', '중분류', '소분류', text_obj', 'text_mthd', 'text_deal' 컬럼을 포함하는 데이터프레임
+        Result
+            - doc[List] : 데이터 별로 'text_obj', 'text_mthd', 'text_deal'을 연결한 list
+            - label[List] : 데이터 별로 category id를 부여한 list
+            - cat2id[Dict] : 소분류(str)를 key로, id(int)를 값으로 가지는 사전 객체
+            - id2cat[Dict] : id(int)를 key로, tuple(대분류, 중분류, 소분류)를 값으로 가지는 사전 객체
+        """
+        
+        # clean text
+        if clean_fn: # text 전처리 함수
+            frame[['text_obj', 'text_mthd', 'text_deal']] = frame[['text_obj', 'text_mthd', 'text_deal']].apply(clean_fn)
+        frame = frame.fillna('') # 결측치 공백('')으로 채우기
+        
+        # labeling
+        frame['digit_2'] = frame['digit_2'].apply(lambda x: num2code(x, 2)) # 중분류를 2자리 코드값으로 변환
+        frame['digit_3'] = frame['digit_3'].apply(lambda x: num2code(x, 3)) # 소분류를 3자리 코드값으로 변환
+        frame['digit'] = frame["digit_1"] + frame["digit_2"] + frame["digit_3"]
+        unique_digit = frame['digit'].sort_values().drop_duplicates().tolist()
+        
+        cat2id, id2cat = {}, {}
+        for i, cat in enumerate(unique_digit):
+            cat2id[cat] = i
+            id2cat[i] = cat
+        frame['label'] = frame['digit'].apply(lambda x: cat2id[x])
+                
+        # train-test split
+        train, test = train_test_split(frame, test_ratio=test_ratio, seed=seed)
+        
+        # upsample
+        if upsample:
+            train = upsample_corpus(train, frac=0.1, seed=seed)
+        
+        def join_text(x):
+            return ' '.join(x)
+        train['text'] = train[['text_obj', 'text_mthd', 'text_deal']].apply(join_text, axis=1)
+        test['text'] = test[['text_obj', 'text_mthd', 'text_deal']].apply(join_text, axis=1)
+        train = train[['text', 'label']]
+        test = test[['text', 'label']]
+
+        return train, test, cat2id, id2cat
+    
+def _preprocess(frame, clean_fn=None, target='S'):
         """
         input
             - frame : '대분류', '중분류', '소분류', text_obj', 'text_mthd', 'text_deal' 컬럼을 포함하는 데이터프레임
@@ -63,17 +154,7 @@ def preprocess(frame, clean_fn=None, target='S'):
             
         return doc.to_list(), label.to_list(), cat2id, id2cat
     
-def augmentation(data):
-    c1=data.groupby('digit').sample(frac=1).reset_index(drop=True)[['text_obj','digit']]
-    c2=data.groupby('digit').sample(frac=1).reset_index(drop=True)[['text_mthd','digit']]
-    c3=data.groupby('digit').sample(frac=1).reset_index(drop=True)[['text_deal','digit']]
-    c_total=pd.DataFrame(c1)
-    c_total=pd.concat([c_total,c2,c3],axis=1,ignore_index = True)
-    c_total=c_total.drop([1,3],axis=1)
-    c_total.columns=['text_obj','text_mthd','text_deal','digit']
-    c_total
-    
-def train_test_split(doc, label, test_ratio=0.1, seed=42):
+def _train_test_split(doc, label, test_ratio=0.1, seed=42):
     """
     temp_df 
     """

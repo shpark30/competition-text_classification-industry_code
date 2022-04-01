@@ -46,11 +46,13 @@ parser=argparse.ArgumentParser(
         description='Training Disease Recognition in Pet CT')
 # parser.add_argument('root', metavar='DIR',
 #                     help='path to data')
-parser.add_argument('--root', default=DATA / 'data' / '1. 실습용자료_중복제거.txt', type=str,
+parser.add_argument('--root', default=DATA / 'data' / '1. 실습용자료_중복제거_hsp.txt', type=str,
                     help='data format should be txt, sep="|"')
 parser.add_argument('--project', default=save_dir, type=str)
-parser.add_argument('--num_test', default=100000, type=int,
+parser.add_argument('--num-test', default=100000, type=int,
                     help='the number of test data')
+parser.add_argument('--upsample', action='store_true',
+                    help='')
 parser.add_argument('--target', default='S', type=str,
                     help='target')
 # parser.add_argument('--num_test_ratio', default=0.1, type=float,
@@ -133,7 +135,7 @@ def main(args):
     global best_epoch
     
     # preprocess data
-    (model, train_set, test_set), cat2id, id2cat = get_model_dataset(args.model, args.root, args.num_test, args.target, args.max_len, args.seed)
+    (model, train_set, test_set), cat2id, id2cat = get_model_dataset(args.model, args.root, args.num_test, args.upsample, args.target, args.max_len, args.seed)
     model = model.to(args.device)
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=args.workers,
@@ -256,7 +258,7 @@ def main(args):
                 "category": list(map(lambda x: ''.join(id2cat[x]), test_loader.dataset.label)),
                 "predictions": list(map(lambda x: ''.join(id2cat[x]), predictions))
             })
-            pred_frame.to_csv(args.project / 'best_model_predictions.csv', encoding='cp949', index=False)
+            pred_frame.to_csv(args.project / 'best_model_predictions.csv', encoding='utf-8-sig', index=False)
             
             
 def train(model, train_loader, optimizer, criterion, scheduler, device):
@@ -329,7 +331,7 @@ def valid(model, valid_loader, criterion, device):
     return predictions, float(valid_loss), acc, class_scores
 
 
-def get_model_dataset(model_type, root, num_test, target, max_len, seed):
+def get_model_dataset(model_type, root, num_test, upsample, target, max_len, seed):
     def _get_kobert_model_dataset(num_classes, doc_train, label_train, doc_test, label_test, max_len):
         kobert, vocab = get_pytorch_kobert_model()
         tokenizer_path = get_tokenizer()
@@ -376,9 +378,11 @@ def get_model_dataset(model_type, root, num_test, target, max_len, seed):
         data = pd.read_csv(root, sep='|', encoding='euc-kr')
     except:
         data = pd.read_csv(root, sep='|', encoding='utf-8')
-    doc, label, cat2id, id2cat = preprocess(data, target=target)
-    test_ratio = num_test/len(label)
-    doc_train, label_train, doc_test, label_test = train_test_split(doc, label, test_ratio=test_ratio, seed=seed)
+        
+    test_ratio = num_test/len(data)
+    train, test, cat2id, id2cat = preprocess(data, test_ratio=test_ratio, upsample=upsample, target=target, seed=seed)
+    doc_train, doc_test, label_train, label_test = train['text'].tolist(), test['text'].tolist(), train['label'].tolist(), test['label'].tolist()
+#     doc_train, label_train, doc_test, label_test = train_test_split(doc, label, test_ratio=test_ratio, seed=seed)
     num_classes = len(cat2id.keys())
     
     if model_type=='kobert':
