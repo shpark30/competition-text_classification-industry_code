@@ -14,7 +14,22 @@ def num2code(num, digits=None):
     code = '0'*(digits-len(num)) + num
     return code
 
-def upsample_corpus(df, frac=0.1, seed=42):
+def upsample_reproduce(df, minimum=500, seed=42):
+    random.seed(seed)
+    labels = df['label'].unique().tolist()
+    upsampled = pd.DataFrame()
+    for lb in labels:
+        temp_df = df[df['label']==lb].copy()
+        if len(temp_df) < minimum:
+            n_rep = minimum//len(temp_df)-1
+            n_sample = minimum%len(temp_df)
+            sample = temp_df.sample(n=n_sample, random_state=seed)
+            temp_df = pd.concat([temp_df for _ in range(n_rep)]+[sample])
+        upsampled = pd.concat([upsampled, temp_df])
+    upsampled = upsampled.reset_index(drop=True)
+    return upsampled
+    
+def upsample_shuffle(df, frac=0.1, seed=42):
     random.seed(seed)
     s1=random.randrange(0, 1000) # seed 1
     s2=random.randrange(0, 1000) # seed 2
@@ -26,6 +41,7 @@ def upsample_corpus(df, frac=0.1, seed=42):
                          sampled_mthd['text_mthd'],
                          sampled_deal['text_deal']], axis=1)
     upsampled = pd.concat([df[['label', 'text_obj', 'text_mthd', 'text_deal']], sampled])
+    print(f'upsample from {len(df)} to {len(df)+len(sampled)}')
     upsampled = upsampled.reset_index(drop=True)
     return upsampled
 
@@ -60,7 +76,7 @@ def train_test_split(frame, test_ratio=0.1, seed=42):
             
     return train, test
 
-def preprocess(frame, test_ratio=0.1, upsample=False, clean_fn=None, target='S', seed=42):
+def preprocess(frame, num_test=100000, upsample=None, clean_fn=None, target='S', seed=42):
         """
         input
             - frame : '대분류', '중분류', '소분류', text_obj', 'text_mthd', 'text_deal' 컬럼을 포함하는 데이터프레임
@@ -75,6 +91,7 @@ def preprocess(frame, test_ratio=0.1, upsample=False, clean_fn=None, target='S',
         if clean_fn: # text 전처리 함수
             frame[['text_obj', 'text_mthd', 'text_deal']] = frame[['text_obj', 'text_mthd', 'text_deal']].apply(clean_fn)
         frame = frame.fillna('') # 결측치 공백('')으로 채우기
+        frame = frame.drop_duplicates(['digit_1', 'digit_2', 'digit_3', 'text_obj', 'text_mthd', 'text_deal'], keep='first')
         
         # labeling
         frame['digit_2'] = frame['digit_2'].apply(lambda x: num2code(x, 2)) # 중분류를 2자리 코드값으로 변환
@@ -89,11 +106,14 @@ def preprocess(frame, test_ratio=0.1, upsample=False, clean_fn=None, target='S',
         frame['label'] = frame['digit'].apply(lambda x: cat2id[x])
                 
         # train-test split
+        test_ratio = num_test/len(frame)
         train, test = train_test_split(frame, test_ratio=test_ratio, seed=seed)
         
         # upsample
-        if upsample:
-            train = upsample_corpus(train, frac=0.1, seed=seed)
+        if upsample=='shuffle':
+            train = upsample_shuffle(train, frac=0.1, seed=seed)
+        elif upsample=='reproduce':
+            train = upsample_reproduce(train, minimum=500, seed=seed)
         
         def join_text(x):
             return ' '.join(x)

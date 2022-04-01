@@ -46,13 +46,13 @@ parser=argparse.ArgumentParser(
         description='Training Disease Recognition in Pet CT')
 # parser.add_argument('root', metavar='DIR',
 #                     help='path to data')
-parser.add_argument('--root', default=DATA / 'data' / '1. 실습용자료_중복제거_hsp.txt', type=str,
+parser.add_argument('--root', default=DATA / 'data' / '1. 실습용자료_hsp2.txt', type=str,
                     help='data format should be txt, sep="|"')
 parser.add_argument('--project', default=save_dir, type=str)
 parser.add_argument('--num-test', default=100000, type=int,
                     help='the number of test data')
-parser.add_argument('--upsample', action='store_true',
-                    help='')
+parser.add_argument('--upsample', default='', type=str,
+                    help='"shuffle", "reproduce"')
 parser.add_argument('--target', default='S', type=str,
                     help='target')
 # parser.add_argument('--num_test_ratio', default=0.1, type=float,
@@ -379,8 +379,7 @@ def get_model_dataset(model_type, root, num_test, upsample, target, max_len, see
     except:
         data = pd.read_csv(root, sep='|', encoding='utf-8')
         
-    test_ratio = num_test/len(data)
-    train, test, cat2id, id2cat = preprocess(data, test_ratio=test_ratio, upsample=upsample, target=target, seed=seed)
+    train, test, cat2id, id2cat = preprocess(data, num_test=num_test, upsample=upsample, target=target, seed=seed)
     doc_train, doc_test, label_train, label_test = train['text'].tolist(), test['text'].tolist(), train['label'].tolist(), test['label'].tolist()
 #     doc_train, label_train, doc_test, label_test = train_test_split(doc, label, test_ratio=test_ratio, seed=seed)
     num_classes = len(cat2id.keys())
