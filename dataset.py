@@ -14,17 +14,63 @@ def num2code(num, digits=None):
     code = '0'*(digits-len(num)) + num
     return code
 
-def upsample_reproduce(df, minimum=500, seed=42):
+def upsample_corpus(df, minimum=500, method='uniform', seed=42):
     random.seed(seed)
     labels = df['label'].unique().tolist()
     upsampled = pd.DataFrame()
     for lb in labels:
+#         if len(temp_df) < minimum:
+#             if method=='random':
+#                 n_sample = minimum-len(temp_df)
+#                 sample = temp_df.sample(n=n_sample, replace=True, random_state=seed)
+#                 temp_df = pd.concat([temp_df, sample])
         temp_df = df[df['label']==lb].copy()
-        if len(temp_df) < minimum:
-            n_rep = minimum//len(temp_df)-1
-            n_sample = minimum%len(temp_df)
-            sample = temp_df.sample(n=n_sample, random_state=seed)
-            temp_df = pd.concat([temp_df for _ in range(n_rep)]+[sample])
+        n = 0
+        while True:
+            n+=1
+            if n==50:
+                import pdb
+                pdb.set_trace()
+            if len(temp_df)>=minimum:
+                break
+                
+            if method=='random':
+                n_sample = minimum-len(temp_df)
+                sample = temp_df.sample(n=n_sample, replace=True, random_state=seed)
+                not_empty_cond = sample[['text_obj','text_mthd','text_deal']].applymap(
+                    lambda x: len(x)!=0).apply(any, axis=1)
+                if not not_empty_cond.all():
+                    sample = sample[not_empty_cond].reset_index(drop=True)
+                temp_df = pd.concat([temp_df, sample])
+            elif method=='uniform':
+                n_rep = minimum//len(temp_df)
+                n_sample = minimum%len(temp_df)
+                sample = temp_df.sample(n=n_sample, random_state=seed)
+                not_empty_cond = sample[['text_obj','text_mthd','text_deal']].applymap(
+                    lambda x: len(x)!=0).apply(any, axis=1)
+                if not not_empty_cond.all():
+                    sample = sample[not_empty_cond].reset_index(drop=True)
+                temp_df = pd.concat([temp_df for _ in range(n_rep)]+[sample])
+            elif method=='shuffle':
+                s1=random.randrange(0, 1000) # seed 1
+                s2=random.randrange(0, 1000) # seed 2
+                s3=random.randrange(0, 1000) # seed 3
+                n_sample = minimum-len(temp_df)
+                sample = pd.concat([
+                    temp_df['text_obj'].sample(n=n_sample, replace=True, 
+                                               random_state=s1).reset_index(drop=True),
+                    temp_df['text_mthd'].sample(n=n_sample, replace=True, 
+                                                random_state=s2).reset_index(drop=True),
+                    temp_df['text_deal'].sample(n=n_sample, replace=True, 
+                                                random_state=s3).reset_index(drop=True)
+                ], axis=1)
+                sample['label'] = lb
+                sample=sample[['label', 'text_obj','text_mthd','text_deal']]
+                not_empty_cond = sample[['text_obj','text_mthd','text_deal']].applymap(
+                    lambda x: len(x)!=0).apply(any, axis=1)
+                if not not_empty_cond.all():
+                    sample = sample[not_empty_cond].reset_index(drop=True)
+                temp_df=pd.concat([temp_df, sample])
         upsampled = pd.concat([upsampled, temp_df])
     upsampled = upsampled.reset_index(drop=True)
     return upsampled
@@ -76,7 +122,7 @@ def train_test_split(frame, test_ratio=0.1, seed=42):
             
     return train, test
 
-def preprocess(frame, num_test=100000, upsample=None, clean_fn=None, target='S', seed=42):
+def preprocess(frame, num_test=100000, upsample='', minimum=500, clean_fn=None, target='S', seed=42):
         """
         input
             - frame : '대분류', '중분류', '소분류', text_obj', 'text_mthd', 'text_deal' 컬럼을 포함하는 데이터프레임
@@ -91,6 +137,7 @@ def preprocess(frame, num_test=100000, upsample=None, clean_fn=None, target='S',
         if clean_fn: # text 전처리 함수
             frame[['text_obj', 'text_mthd', 'text_deal']] = frame[['text_obj', 'text_mthd', 'text_deal']].apply(clean_fn)
         frame = frame.fillna('') # 결측치 공백('')으로 채우기
+        # 중복제거
         frame = frame.drop_duplicates(['digit_1', 'digit_2', 'digit_3', 'text_obj', 'text_mthd', 'text_deal'], keep='first')
         
         # labeling
@@ -110,10 +157,8 @@ def preprocess(frame, num_test=100000, upsample=None, clean_fn=None, target='S',
         train, test = train_test_split(frame, test_ratio=test_ratio, seed=seed)
         
         # upsample
-        if upsample=='shuffle':
-            train = upsample_shuffle(train, frac=0.1, seed=seed)
-        elif upsample=='reproduce':
-            train = upsample_reproduce(train, minimum=500, seed=seed)
+        if upsample:
+            train = upsample_corpus(train, minimum=minimum, method=upsample, seed=seed)
         
         def join_text(x):
             return ' '.join(x)

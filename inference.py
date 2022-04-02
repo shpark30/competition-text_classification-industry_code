@@ -25,7 +25,7 @@ def main(args):
     doc_id, doc = data.index.tolist(), data[['text_obj', 'text_mthd', 'text_deal']].fillna('')
     doc = doc.apply(lambda x: ' '.join(x), axis=1).tolist()
     
-    checkpoint = torch.load(os.path.join(args.exp_path, 'weights/best.pth.tar'), map_location=args.device)
+    checkpoint = torch.load(os.path.join(args.exp_path, 'weights/additional2.pth.tar'), map_location=args.device)
     with open(os.path.join(args.exp_path, 'config.json'), 'r') as f:
         checkpoint_args = json.load(f)
     with open(os.path.join(args.exp_path, 'id2cat.json'), 'r') as f:
@@ -63,12 +63,7 @@ def main(args):
             output = model(input_ids, attention_mask, token_type_ids)
             output = torch.argmax(output, 1)
             
-            try:
-                output_cat = list(map(lambda x: id2cat[str(x)], output.cpu().tolist()))
-            except:
-                import pdb
-                pdb.set_trace()
-                output_cat = list(map(lambda x: id2cat[str(x)], output.cpu().tolist()))
+            output_cat = list(map(lambda x: id2cat[str(x)], output.cpu().tolist()))
             for r, digit in zip(doc_id.tolist(), output_cat):
                 data.loc[r, ['digit_1', 'digit_2', 'digit_3']] = digit
     

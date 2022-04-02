@@ -41,15 +41,18 @@ def increment_path(path, exist_ok=False, sep='', mkdir=False):
 
 def save_performance_graph(summary_path, save_path):
     data = pd.read_csv(summary_path, encoding='cp949')
-    best_epoch = data.loc[data['valid loss'].tolist().index(data['valid loss'].min()), 'epoch']
+    best_acc_epoch = data.loc[data['valid loss'].tolist().index(data['valid loss'].min()), 'epoch']
+    best_loss_epoch = data.loc[data['accuracy'].tolist().index(data['accuracy'].max()), 'epoch']
 
     fig = plt.figure(figsize=(20, 20))
     ax1 = fig.add_subplot(2,1,1)
     ax1.set_title('Train & Valid Loss Graph', fontsize=25)
     ax1.plot(data['epoch'], data['train loss'], label='train')
     ax1.plot(data['epoch'], data['valid loss'], label='valid')
-    ax1.axvline(best_epoch, color='lightgray', linestyle='--', linewidth=2,
-               label=f'best epoch: {best_epoch}')
+    ax1.axvline(best_acc_epoch, color='gray', linestyle='--', linewidth=2,
+               label=f'best_acc_epoch: {best_acc_epoch}')
+    ax1.axvline(best_loss_epoch, color='lightgray', linestyle='--', linewidth=2,
+               label=f'best_loss_epoch: {best_loss_epoch}')
     ax1.set_xlabel('epoch', size=20)
     ax1.set_ylabel('loss', size=20)
     ax1.tick_params (axis = 'x', labelsize =15)
@@ -62,8 +65,10 @@ def save_performance_graph(summary_path, save_path):
     ax2.plot(data['epoch'], data['precision'], label='precision')
     ax2.plot(data['epoch'], data['recall'], label='recall')
     ax2.plot(data['epoch'], data['f1score'], label='f1score')
-    ax2.axvline(best_epoch, color='lightgray', linestyle='--', linewidth=2,
-               label=f'best epoch: {best_epoch}')
+    ax2.axvline(best_acc_epoch, color='gray', linestyle='--', linewidth=2,
+               label=f'best_acc_epoch: {best_acc_epoch}')
+    ax2.axvline(best_loss_epoch, color='lightgray', linestyle='--', linewidth=2,
+               label=f'best_loss_epoch: {best_loss_epoch}')
     ax2.set_xlabel('epoch', size=20)
     ax2.set_ylabel('loss', size=20)
     ax2.tick_params (axis = 'x', labelsize =15)

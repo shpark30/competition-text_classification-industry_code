@@ -52,7 +52,9 @@ parser.add_argument('--project', default=save_dir, type=str)
 parser.add_argument('--num-test', default=100000, type=int,
                     help='the number of test data')
 parser.add_argument('--upsample', default='', type=str,
-                    help='"shuffle", "reproduce"')
+                    help='"shuffle", "reproduce", "random"')
+parser.add_argument('--minimum', default=500, type=int,
+                    help='(upsample) setting the minimum number of data of each categories')
 parser.add_argument('--target', default='S', type=str,
                     help='target')
 # parser.add_argument('--num_test_ratio', default=0.1, type=float,
@@ -76,6 +78,10 @@ parser.add_argument('--epochs', default=10, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
+parser.add_argument('--patience', default=10, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('--additional-epochs', default=5, type=int, metavar='N',
+                    help='additional train epochs')              
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
 
@@ -128,14 +134,15 @@ with open(args.project / 'config.json', 'w', encoding='cp949') as f:
 
 print('output path:', args.project)
 
-best_score = None
+best_acc = None
+best_loss = None
 
 def main(args):
-    global best_score
-    global best_epoch
+    global best_acc
+    global best_loss
     
     # preprocess data
-    (model, train_set, test_set), cat2id, id2cat = get_model_dataset(args.model, args.root, args.num_test, args.upsample, args.target, args.max_len, args.seed)
+    (model, train_set, test_set), cat2id, id2cat = get_model_dataset(args.model, args.root, args.num_test, args.upsample, args.minimum, args.target, args.max_len, args.seed)
     model = model.to(args.device)
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=args.workers,
@@ -155,7 +162,11 @@ def main(args):
     betas=(args.beta1, args.beta2)
     optimizer = get_optimizer(optimizer_type=args.optimizer, model=model, lr=args.lr, betas=betas,
                               weight_decay=args.weight_decay, eps=args.epsilon, amsgrad=args.amsgrad)
-
+    
+    # lr-scheduler
+    t_total = len(train_loader) * args.epochs
+    scheduler = get_scheduler(name=args.lr_scheduler, optimizer=optimizer, num_warmup_steps=args.warmup_step, num_training_steps=t_total)
+                    
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -169,18 +180,17 @@ def main(args):
             model.load_state_dict(checkpoint['state_dict'])
             # build optimizer
             optimizer.load_state_dict(checkpoint['optimizer'])
+            # build scheduler
+            scheduler.load_state_dict(checkpoint['scheduler'])
             args.start_epoch = checkpoint['epoch']
-            best_score = checkpoint['best_score']
+            best_loss = checkpoint['best_loss']
+            best_acc = checkpoint['best_acc']
             
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
             print('start epoch: {}'.format(args.start_epoch))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
-            
-    # lr-scheduler
-    t_total = len(train_loader) * args.epochs
-    scheduler = get_scheduler(name=args.lr_scheduler, optimizer=optimizer, num_warmup_steps=args.warmup_step, num_training_steps=t_total)
 
     # loss function
     criterion = get_loss(args.loss)
@@ -239,18 +249,18 @@ def main(args):
         save_performance_graph(args.project / 'summary.csv', args.project / 'performance.png')
         
         # model save
-        epoch_score = acc
-        is_best = best_score is None or epoch_score > best_score
         torch.save({'state_dict': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'best score': acc if is_best else best_score,
+                    'scheduler': scheduler.state_dict(),
+                    'best acc': acc if best_acc is None or acc > best_acc else best_acc,
+                    'best loss': valid_loss if best_loss is None or valid_loss <= best_loss else best_loss,
                     'epoch': epoch},
                    args.project / 'weights' / 'checkpoint.pth.tar')
         
-        if is_best: 
-            print(f'Validation score got better {best_score} --> {epoch_score}.  Saving model ...')
-            shutil.copyfile(args.project / 'weights' / 'checkpoint.pth.tar', args.project / 'weights' / 'best.pth.tar')
-            best_score = epoch_score
+        if  best_acc is None or acc > best_acc: 
+            print(f'Validation score got better {best_acc} --> {acc}.  Saving model ...')
+            shutil.copyfile(args.project / 'weights' / 'checkpoint.pth.tar', args.project / 'weights' / 'best_acc.pth.tar')
+            best_acc = acc
             
             # save valid predictions
             pred_frame = pd.DataFrame({
@@ -258,9 +268,75 @@ def main(args):
                 "category": list(map(lambda x: ''.join(id2cat[x]), test_loader.dataset.label)),
                 "predictions": list(map(lambda x: ''.join(id2cat[x]), predictions))
             })
-            pred_frame.to_csv(args.project / 'best_model_predictions.csv', encoding='utf-8-sig', index=False)
+            pred_frame.to_csv(args.project / 'best_acc_predictions.csv', encoding='utf-8-sig', index=False)
+        
+        if  best_loss is None or valid_loss > best_loss: 
+            print(f'Validation score got better {best_loss} --> {valid_loss}.  Saving model ...')
+            shutil.copyfile(args.project / 'weights' / 'checkpoint.pth.tar', args.project / 'weights' / 'best_loss.pth.tar')
+            best_loss = valid_loss
             
+            # save valid predictions
+            pred_frame = pd.DataFrame({
+                "doc": test_loader.dataset.doc,
+                "category": list(map(lambda x: ''.join(id2cat[x]), test_loader.dataset.label)),
+                "predictions": list(map(lambda x: ''.join(id2cat[x]), predictions))
+            })
+            pred_frame.to_csv(args.project / 'best_loss_predictions.csv', encoding='utf-8-sig', index=False)
+            patience = 0
+        else:
+            logger.info(f'patience {patience} --> {patience+1}')
+            patience += 1
+        
+        if patience >= args.patience:
+            logger.info('Early Stop!')
+            break
             
+    # additional training
+    logger.info(f'Additional Training with Validation Dataset for {args.additional_epochs} epochs')
+                    
+    checkpoint = torch.load(args.project / 'weights' / 'best_loss.pth.tar', map_location=args.device)
+    model.load_state_dict(checkpoint['state_dict']) # build model
+    logger.info('load model')
+    betas=(args.beta1, args.beta2)
+    optimizer = get_optimizer(optimizer_type=args.optimizer, model=model, lr=args.lr, betas=betas,
+                              weight_decay=args.weight_decay, eps=args.epsilon, amsgrad=args.amsgrad)
+    # lr-scheduler
+    t_total = len(train_loader) * args.epochs
+    scheduler = get_scheduler(name=args.lr_scheduler, optimizer=optimizer, num_warmup_steps=args.warmup_step, num_training_steps=t_total)
+#     optimizer.load_state_dict(checkpoint['optimizer']) # build optimizer
+#     logger.info('load optimizer')
+#     scheduler.load_state_dict(checkpoint['scheduler']) # build scheduler
+#     logger.info('load scheduler')
+    ad_train_loader = DataLoader(test_set, batch_size=args.batch_size, num_workers=args.workers,
+                             shuffle=True, pin_memory=False)
+    ad_test_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=args.workers,
+                             shuffle=False, pin_memory=False)
+    
+    logger.info('start add-train')
+    for epoch in range(args.additional_epochs):
+        # epoch train
+        train_loss = train(model, ad_train_loader, optimizer, criterion, scheduler, args.device)
+        predictions, valid_loss, acc, class_scores = valid(model, ad_test_loader, criterion, args.device)
+        
+        # logging scores
+        macro_pc = statistics.mean(class_scores['precision'])
+        macro_rc = statistics.mean(class_scores['recall'])
+        macro_f1 = statistics.mean(class_scores['f1score'])
+        logger.info(f'Epoch {epoch} Result')
+        logger.info(f'\ttrain loss: {train_loss}\tvalid_loss: {valid_loss}')
+        logger.info(f'\tacc: {round(acc, 6)}\tpc: {round(macro_pc, 6)}\trc: {round(macro_rc, 6)}\tf1: {round(macro_f1, 6)}')
+        
+    torch.save({'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best loss': checkpoint['best loss'],
+                'best acc': checkpoint['best acc'],
+                'epoch': checkpoint['epoch'],
+                'additional_epoch': epoch
+               },
+                args.project / 'weights' / 'additional.pth.tar')
+    logger.info('save model')
+        
 def train(model, train_loader, optimizer, criterion, scheduler, device):
     train_loss = 0
     model.train()
@@ -331,7 +407,7 @@ def valid(model, valid_loader, criterion, device):
     return predictions, float(valid_loss), acc, class_scores
 
 
-def get_model_dataset(model_type, root, num_test, upsample, target, max_len, seed):
+def get_model_dataset(model_type, root, num_test, upsample, minimum, target, max_len, seed):
     def _get_kobert_model_dataset(num_classes, doc_train, label_train, doc_test, label_test, max_len):
         kobert, vocab = get_pytorch_kobert_model()
         tokenizer_path = get_tokenizer()
@@ -379,7 +455,7 @@ def get_model_dataset(model_type, root, num_test, upsample, target, max_len, see
     except:
         data = pd.read_csv(root, sep='|', encoding='utf-8')
         
-    train, test, cat2id, id2cat = preprocess(data, num_test=num_test, upsample=upsample, target=target, seed=seed)
+    train, test, cat2id, id2cat = preprocess(data, num_test=num_test, upsample=upsample, minimum=minimum, target=target, seed=seed)
     doc_train, doc_test, label_train, label_test = train['text'].tolist(), test['text'].tolist(), train['label'].tolist(), test['label'].tolist()
 #     doc_train, label_train, doc_test, label_test = train_test_split(doc, label, test_ratio=test_ratio, seed=seed)
     num_classes = len(cat2id.keys())
