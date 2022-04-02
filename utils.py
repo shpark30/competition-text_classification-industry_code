@@ -8,6 +8,9 @@ import matplotlib.pyplot as plt
 
 def create_logger(log_path, name='torch', file_name='train.log', fmt='%(asctime)s | %(message)s'):
     logger = logging.getLogger(name)
+    # Check handler exists
+    if len(logger.handlers) > 0:
+        return logger # Logger already exists
     formatter = logging.Formatter(fmt)
     logger.setLevel(logging.INFO)
     stream_hander = logging.StreamHandler()
@@ -76,7 +79,7 @@ def save_performance_graph(summary_path, save_path):
     ax2.legend(loc='best', fontsize=20, frameon=True, shadow=True)
 
     plt.savefig(save_path, dpi=50)
-    del fig
+    plt.close(fig)
         
         
 if __name__=='__main__':
