@@ -3,6 +3,7 @@ import logging
 import json
 import statistics
 import csv
+from copy import copy
 from typing import Optional, Union, List
 import pandas as pd
 import numpy as np
@@ -452,7 +453,7 @@ def main(args):
     num_classes = len(cat2id)
     for e in range(args.estimators):
         patience = 0 # early stop patience
-        model_args = args.copy() # config for {e}th model
+        model_args = copy(args) # config for {e}th model
         model_args.project = args.project / f'model{e}' # runs/train/exp00/model{e}
         create_directory(model_args.project / 'weights') # runs/train/exp00/model{e}/weights
         logger.info(f'Start Training Model{e}')
@@ -478,7 +479,7 @@ def main(args):
             json.dump(arg_dict, f, indent=4)
 
         # optimizer
-        optimizer = get_optimizer(args.optimizer, model, args.learning_rate,
+        optimizer = get_optimizer(args.optimizer, model, args.lr,
                                   (args.beta1, args.beta2), args.weight_decay, eps=1e-08, amsgrad=False)
 
         # lr scheduler
@@ -647,7 +648,7 @@ def main(args):
                 logger.info('Early Stop!')
                 break
             del class_scores, predictions
-        base_models.append(model.classifier.copy())
+        base_models.append(copy(model.classifier))
         del history_frame
         
     # Build Ensemble Model
@@ -669,7 +670,7 @@ def main(args):
             self.bert=bert
             self.gpt=gpt
             self.bert_classifiers=bert_classifiers
-            self.gpt_classifiers=gpt_classfiers
+            self.gpt_classifiers=gpt_classifiers
             self.aggregation=aggregation
             if aggregation=='mean_softmax':
                 self.aggregation_fn=self.mean_softmax
