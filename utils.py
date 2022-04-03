@@ -42,6 +42,12 @@ def increment_path(path, exist_ok=False, sep='', mkdir=False):
         path.mkdir(parents=True, exist_ok=True)  # make directory
     return path
 
+def num2code(num, digits=0):
+    """ int타입의 데이터를 일정한 자릿수(digits)의 코드값으로 변환 """
+    num = str(num)
+    code = '0'*(digits-len(num)) + num
+    return code
+
 def save_performance_graph(summary_path, save_path):
     data = pd.read_csv(summary_path, encoding='cp949')
     best_acc_epoch = data.loc[data['valid loss'].tolist().index(data['valid loss'].min()), 'epoch']
