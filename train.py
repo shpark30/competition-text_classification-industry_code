@@ -28,8 +28,8 @@ import gluonnlp as nlp
 from kobert.utils import get_tokenizer
 from kobert.pytorch_kobert import get_pytorch_kobert_model
 
-print('pytorch ver:', torch.__version__)
-print('transformers ver:', transformers.__version__)
+#print('pytorch ver:', torch.__version__)
+#print('transformers ver:', transformers.__version__)
 
 from loss import CrossEntropy, FocalCrossEntropy, label2target
 from utils import create_logger, create_directory, increment_path, save_performance_graph
@@ -43,13 +43,14 @@ save_dir = increment_path(Path(ROOT) / 'runs'/ 'train' / 'exp')
     
 # Dataset
 parser=argparse.ArgumentParser(
-        description='Training Disease Recognition in Pet CT')
+        description='Training Industry Recognition')
 # parser.add_argument('root', metavar='DIR',
 #                     help='path to data')
-parser.add_argument('--root', default=DATA / 'data' / '1. 실습용자료_중복제거.txt', type=str,
+parser.add_argument('--root', default=DATA / 'jupyter'/ 'data' /'data'/ '1. 실습용자료.txt', type=str,
                     help='data format should be txt, sep="|"')
+
 parser.add_argument('--project', default=save_dir, type=str)
-parser.add_argument('--num_test', default=100000, type=int,
+parser.add_argument('--num_test', default=30000, type=int,
                     help='the number of test data')
 # parser.add_argument('--num_test_ratio', default=0.1, type=float,
 #                     help='a ratio of test data')
@@ -80,7 +81,7 @@ parser.add_argument('--loss', default='FCE', type=str,
                     help='Loss function. Availabel loss functions are . default is Focal Cross Entropy(FCE).')
 
 # Learning rate
-parser.add_argument('-lr', '--learning-rate', default=0.02, type=float,
+parser.add_argument('-lr', '--learning-rate', default=0.00005, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--lr-scheduler', default='cosine_with_restarts',
                     type=str, help='Available schedulers are "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup')

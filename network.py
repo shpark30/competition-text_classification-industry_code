@@ -21,7 +21,7 @@ class KOBERTClassifier(nn.Module):
 #         return attention_mask.float()
 
     def forward(self, token_ids, attention_mask, token_type_ids):
-        _, pooler = self.bert(input_ids=token_ids,
+        _, pooler = self.bert(input_ids=token_ids.long(),
                               token_type_ids=token_type_ids.long(),
                               attention_mask=attention_mask.float())
         if self.dr_rate:

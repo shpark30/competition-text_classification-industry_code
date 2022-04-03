@@ -24,25 +24,46 @@ def preprocess(frame, augmentation=False, clean_fn=None):
             - id2cat[Dict] : id(int)를 key로, tuple(대분류, 중분류, 소분류)를 값으로 가지는 사전 객체
         """
         
-        def _augmentation(frame):
-            ~~~~~
-            return frame
+#         def _augmentation(frame):
+#             ~~~~~
+#             return frame
             
-        # 0. augmentation
-        if augmentation:
-            frame = augmentation(frame)
+#         # 0. augmentation
+#         if augmentation:
+#             frame = augmentation(frame)
             
         # 1. doc
-        frame[['text_obj', 'text_mthd', 'text_deal']] = frame[['text_obj', 'text_mthd', 'text_deal']].fillna('')
+        frame['digit'] = frame["digit_1"].map(lambda x:x)+"-"+frame["digit_2"].map(lambda x:str(x))+"-"+frame["digit_3"].map(lambda x:str(x))
+        frame['text_obj']=frame.groupby('digit').text_obj.bfill()
+        frame['text_mthd']=frame.groupby('digit').text_mthd.ffill()
+        frame['text_deal']=frame.groupby('digit').text_deal.bfill()
+
+        c1=frame.groupby('digit').sample(frac=0.1,random_state=42).reset_index(drop=True)[['text_obj','digit']]
+        c2=frame.groupby('digit').sample(frac=0.1,random_state=43).reset_index(drop=True)[['text_mthd','digit']]
+        c3=frame.groupby('digit').sample(frac=0.1,random_state=44).reset_index(drop=True)[['text_deal','digit']]
+        c_total=pd.DataFrame(c1)
+        c_total=pd.concat([c_total,c2,c3],axis=1,ignore_index = True)
+        c_total=c_total.drop([1,3],axis=1)
+        c_total.columns=['text_obj','text_mthd','text_deal','digit']
+        c_total = c_total.fillna('')
+        c_total[['digit_1','digit_2','digit_3']]=pd.DataFrame(c_total.digit.str.split('-').tolist())
+        frame=pd.concat([frame,c_total],axis=0,ignore_index = True)
+        frame
+        frame['digit_2'] = frame['digit_2'].apply(lambda x: num2code(x, 2)) # 중분류를 2자리 코드값으로 변환
+        frame['digit_3'] = frame['digit_3'].apply(lambda x: num2code(x, 3)) # 소분류를 3자리 코드값으로 변환
+
+        
         if clean_fn: # text 전처리 함수
             frame[['text_obj', 'text_mthd', 'text_deal']] = frame[['text_obj', 'text_mthd', 'text_deal']].apply(clean_fn)
+        frame = frame.fillna('')
+        frame.drop_duplicates(subset=['text_obj', 'text_mthd', 'text_deal'], keep='first',inplace=True)
         doc: pd.Series = frame[['text_obj', 'text_mthd', 'text_deal']].apply(lambda x: ' '.join(x), axis=1)
         
         
         
         # 2. label
-        frame['digit_2'] = frame['digit_2'].apply(lambda x: num2code(x, 2)) # 중분류를 2자리 코드값으로 변환
-        frame['digit_3'] = frame['digit_3'].apply(lambda x: num2code(x, 3)) # 소분류를 3자리 코드값으로 변환
+#         frame['digit_2'] = frame['digit_2'].apply(lambda x: num2code(x, 2)) # 중분류를 2자리 코드값으로 변환
+#         frame['digit_3'] = frame['digit_3'].apply(lambda x: num2code(x, 3)) # 소분류를 3자리 코드값으로 변환
         
             # 훈련 데이터에 있는 유니크한 분류값
         unique_categories = frame[['digit_1', 'digit_2', 'digit_3']].drop_duplicates().apply(lambda x: tuple(x), axis=1).sort_values().to_list()
@@ -54,11 +75,13 @@ def preprocess(frame, augmentation=False, clean_fn=None):
             id2cat[i] = cat
             
         label: pd.Series = frame['digit_3'].apply(lambda x: cat2id[x])
+        #import pdb
+        #pdb.set_trace()
         return doc.to_list(), label.to_list(), cat2id, id2cat
     
 
 def train_test_split(doc, label, test_ratio=0.1, seed=42):
-    """
+    """len
     temp_df 
     """
     temp_df = pd.DataFrame({'doc': doc, 'label': label})
@@ -79,6 +102,7 @@ def train_test_split(doc, label, test_ratio=0.1, seed=42):
                 slice_idx = int(len(temp_df_l)*test_ratio)
             train = pd.concat([train, temp_df_l.iloc[slice_idx:, :]])
             test = pd.concat([test, temp_df_l.iloc[:slice_idx, :]])
+            
     return train['doc'].to_list(), train['label'].to_list(), test['doc'].to_list(), test['label'].to_list()
             
 class KOBERTClassifyDataset(Dataset):
