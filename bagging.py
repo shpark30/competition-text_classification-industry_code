@@ -3,13 +3,13 @@ import logging
 import json
 import statistics
 import csv
-from copy import copy
+from copy import copy, deepcopy
 from typing import Optional, Union, List
 import pandas as pd
 import numpy as np
 import shutil
 from tqdm import tqdm
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, OrderedDict
 import pathlib
 from pathlib import Path
 import argparse
@@ -24,21 +24,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from transformers import BertModel, GPTJForCausalLM, GPT2LMHeadModel
-from transformers import PreTrainedTokenizerFast, AutoTokenizer
 from transformers.optimization import get_scheduler
 
 import gluonnlp as nlp
 from kobert.utils import get_tokenizer
 from kobert.pytorch_kobert import get_pytorch_kobert_model
 
-from loss import CrossEntropy, FocalCrossEntropy, label2target
-from utils import create_logger, create_directory, increment_path, save_performance_graph, num2code
-from dataset import train_test_split
+from load import *
+from loss import CrossEntropy, FocalCrossEntropy, label2target, get_loss
+from utils import vote, create_logger, create_directory, increment_path, save_performance_graph, get_optimizer, Evaluator
+from dataset import train_test_split, num2code, concat_text, bootstrap, upsample_corpus, EnsembleDataset
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false" # https://github.com/pytorch/pytorch/issues/57273
 os.environ["CUDA_VISIBLE_DEVICES"] = '0,1'
-os.environ["CUDA_LAUNCH_BLOCKING"] = '0,1'
+os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 
 
 def main(args):
@@ -52,7 +51,7 @@ def main(args):
     logger = create_logger(args.project, name=f'ensemble', file_name='log.txt')
     
     # load data
-    data = pd.read_csv(args.root, sep='|', encoding='utf-8')
+    data = pd.read_csv(args.root, sep='|', encoding='cp949')
     
     # 대-중-소 이어붙이기
     data['digit_2'] = data['digit_2'].apply(lambda x:  num2code(x, 2))
@@ -75,89 +74,18 @@ def main(args):
     
     # Train Test Split
     test_ratio = args.num_test/len(data)
-    train, test = train_test_split(data, test_ratio=test_ratio, seed=args.seed)
+    train, test = train_test_split(data, test_ratio=test_ratio, seed=5986)
     logger.info(f'# base model train data: {args.num_samples}')
-    logger.info('# ensemble test data: {len(test)}')
+    logger.info(f'# ensemble test data: {len(test)}')
     
     # Sub Sampling
-    def bootstrap(data, estimators, dist='same', num_samples=100000, min_cat_data=2, seed=42):
-        def _sampling_same(data, seed, total_samples, min_cat_data):
-            n = min_cat_data
-            e = total_samples/len(data)
-            random.seed(seed)
-            sub_data = pd.DataFrame()
-            for lb in data['label'].unique().tolist():
-                data_lb = data[data['label']==lb].copy()
-                seed_lb = random.randint(0, 1000)
-                if len(data_lb) <= n:
-                    n_sampled = len(data_lb)
-                else:
-                    a, b = (100*e-n)/(100-n), 100*n*(1-e)/(100-n)
-                    n_sampled = int(a*len(data_lb) + b)
-                sub_data = pd.concat([sub_data, data_lb.sample(n=n_sampled, random_state=seed_lb)])
-                sub_data = sub_data.reset_index(drop=True)
-            return sub_data
-        
-        def _sampling_random(data, seed, total_samples, min_cat_data, cut_std=1000):
-            dist = data['label'].value_counts().to_frame().reset_index()
-            dist.columns = ['label', 'cnt']
-            def rand_num(max_range, min_range=3, seed=42):
-                random.seed(seed)
-                if max_range <= min_range:
-                    min_range = max_range
-                assert max_range >= min_range
-                return random.randint(min_range, max_range)
-            i = 0
-            while True:
-                dist['n_samples'] = dist.apply(lambda x: rand_num(x[1], min_cat_data, seed=seed+x[0]+i), axis=1)
-                sum_samples = sum(dist['n_samples'])
-                i += 1
-                if sum_samples < total_samples:
-                    continue
-                elif sum_samples > total_samples:
-                    save_num = total_samples - dist[dist['n_samples'] < cut_std]['n_samples'].sum()
-                    to_cut_df_dist = dist[dist['n_samples'] >= cut_std]
-                    to_cut_df = pd.DataFrame()
-                    for lb, n in zip(*[to_cut_df_dist['label'].tolist(), to_cut_df_dist['n_samples'].tolist()]):
-                        to_cut_df = pd.concat([to_cut_df, pd.DataFrame({'label': [lb]*n})])
-                    to_cut_df = to_cut_df.reset_index(drop=True)
-                    adj_cut_df = to_cut_df.sample(n=save_num, random_state=42)
-                    adj_cut_df_dist = adj_cut_df['label'].value_counts().to_frame().reset_index()
-                    adj_cut_df_dist.columns = ['label', 'cnt']
-                    for lb, n in zip(*[adj_cut_df_dist['label'].tolist(), adj_cut_df_dist['cnt'].tolist()]):
-                        r = dist[dist['label']==lb].index[0]
-                        dist.loc[r, 'n_samples'] = n
-                    assert dist['n_samples'].sum() == total_samples
-                    break
-                else: # sum_samples == total_samples
-                    break
-            sub_data = pd.DataFrame()
-            for lb in data['label'].unique().tolist():
-                n_sampled = int(dist[dist['label']==lb]['n_samples'])
-                data_lb = data[data['label']==lb].copy()
-                seed_lb = random.randint(0, 1000)
-                sub_data = pd.concat([sub_data, data_lb.sample(n=n_sampled, random_state=seed_lb)])
-                sub_data = sub_data.reset_index(drop=True)
-            return sub_data
-        
-        sub_data_list = [] # 생성된 서브데이터를 담을 리스트
-        print("BootStrapping!")
-        for estimator in tqdm(range(args.estimators), total=args.estimators): # args.estimators 만큼 서브데이터 생성
-            random.seed(seed*estimator)
-            seed_i = random.randint(0, 1000)
-            if dist=='same':
-                sub_data = _sampling_same(data, seed_i, num_samples, min_cat_data)
-            elif dist=='random':
-                sub_data = _sampling_random(data, seed_i, num_samples, min_cat_data)
-            sub_data_list.append(sub_data)
-        print('sub data 수:', len(sub_data_list))
-        print('sub data 카테고리 수:',
-              [(i, len(sub_data['label'].unique())) for i, sub_data in enumerate(sub_data_list)])
-        return sub_data_list
-    
-    sub_data_list = bootstrap(train, args.estimators,
+    sub_data_list, oob = bootstrap(train, args.estimators,
                               dist=args.sample_dist, num_samples=args.num_samples,
                               seed=args.seed)
+#     test = pd.concat([test, oob]).reset_index(drop=True)
+    logger.info(f'sub data 수: {len(sub_data_list)}')
+    logger.info(f'sub data 카테고리 수: {[(i, len(sub_data["label"].unique())) for i, sub_data in enumerate(sub_data_list)]}')
+    logger.info(f'out of bag(oob) will be used to test. new_test = test({len(test)-len(oob)}) + oob({len(oob)}) = {len(test)}')
     
     # Save sub datasets
     for i, sub_data in enumerate(sub_data_list):
@@ -172,291 +100,56 @@ def main(args):
     
     # Sub train-valid split
     sub_train_list, sub_valid_list = zip(*map(lambda sub_data: train_test_split(
-                                                    sub_data, test_ratio=args.sub_valid_ratio, seed=args.seed),
+                                                    sub_data, test_ratio=args.num_sub_valid/len(sub_data), seed=args.seed),
                                               sub_data_list))
     
     # Upsampling
-    def upsample_corpus(df, minimum=500, method='uniform', seed=42):
-        random.seed(seed)
-        labels = df['label'].unique().tolist()
-        upsampled = pd.DataFrame()
-        for lb in labels:
-            temp_df = df[df['label']==lb].copy()
-            n = 0
-            while True:
-                n+=1
-                if n==50:
-                    import pdb
-                    pdb.set_trace()
-                if len(temp_df)>=minimum:
-                    break
-
-                if method=='random':
-                    n_sample = minimum-len(temp_df)
-                    sample = temp_df.sample(n=n_sample, replace=True, random_state=seed)
-                    not_empty_cond = sample[['text_obj','text_mthd','text_deal']].applymap(
-                        lambda x: len(x)!=0).apply(any, axis=1)
-                    if not not_empty_cond.all():
-                        sample = sample[not_empty_cond].reset_index(drop=True)
-                    temp_df = pd.concat([temp_df, sample])
-                elif method=='uniform':
-                    n_rep = minimum//len(temp_df)
-                    n_sample = minimum%len(temp_df)
-                    sample = temp_df.sample(n=n_sample, random_state=seed)
-                    not_empty_cond = sample[['text_obj','text_mthd','text_deal']].applymap(
-                        lambda x: len(x)!=0).apply(any, axis=1)
-                    if not not_empty_cond.all():
-                        sample = sample[not_empty_cond].reset_index(drop=True)
-                    temp_df = pd.concat([temp_df for _ in range(n_rep)]+[sample])
-                elif method=='shuffle':
-                    s1=random.randrange(0, 1000) # seed 1
-                    s2=random.randrange(0, 1000) # seed 2
-                    s3=random.randrange(0, 1000) # seed 3
-                    n_sample = minimum-len(temp_df)
-                    sample = pd.concat([
-                        temp_df['text_obj'].sample(n=n_sample, replace=True, 
-                                                   random_state=s1).reset_index(drop=True),
-                        temp_df['text_mthd'].sample(n=n_sample, replace=True, 
-                                                    random_state=s2).reset_index(drop=True),
-                        temp_df['text_deal'].sample(n=n_sample, replace=True, 
-                                                    random_state=s3).reset_index(drop=True)
-                    ], axis=1)
-                    sample['label'] = lb
-                    sample=sample[['label', 'text_obj','text_mthd','text_deal']]
-                    not_empty_cond = sample[['text_obj','text_mthd','text_deal']].applymap(
-                        lambda x: len(x)!=0).apply(any, axis=1)
-                    if not not_empty_cond.all():
-                        sample = sample[not_empty_cond].reset_index(drop=True)
-                    temp_df=pd.concat([temp_df, sample])
-            upsampled = pd.concat([upsampled, temp_df])
-        upsampled = upsampled.reset_index(drop=True)
-        return upsampled
-    
     logger.info(f'sub train 수(before upsample): {[len(sub_train) for sub_train in sub_train_list]}')
-    sub_train_list = list(map(
-        lambda sub_train: upsample_corpus(sub_train, minimum=args.minimum, method=args.upsample, seed=args.seed),
-        sub_train_list
-    ))
+    if args.upsample != '':
+        sub_train_list = list(map(
+            lambda sub_train: upsample_corpus(sub_train, minimum=args.minimum, method=args.upsample, seed=args.seed),
+            sub_train_list
+        ))
     logger.info(f'sub train 수(after upsample): {[len(sub_train) for sub_train in sub_train_list]}')
     
     
     # text 이어붙이기
-    def concat_text(data):
-        data['text'] = data[['text_obj', 'text_mthd', 'text_deal']].apply(
-                lambda text_tuple: ' '.join(text_tuple), axis=1)
-        return data
-
     sub_train_list = [concat_text(sub_train) for sub_train in sub_train_list]
     sub_valid_list = [concat_text(sub_valid) for sub_valid in sub_valid_list]
     test = concat_text(test)
     
-    # Data Loaders
+    # Load Backbone, Data Loaders
+    backbones = {}
+    tokenizers = {}
     train_loaders = []
     valid_loaders = []
-    if args.model == 'ensemble':
-        n_bert = int(args.estimators/2)
-        n_gpt = args.estimators - n_bert
-    elif args.model == 'ensemble-kobert':
-        n_bert = args.estimators
-        n_gpt = 0
-    elif args.model == 'ensemble-kogpt2':
-        n_bert = 0
-        n_gpt = args.estimators
-    else:
-        import pdb
-        pdb.set_trace()
-#         raise f'{args.model} is not available for --model'
-
-    logger.info(f'bert base model {n_bert}개')
-    logger.info(f'gpt base model {n_gpt}개')
-    
-        # Kobert Data Loaders
-    class KOBERTClassifyDataset(Dataset):
-        def __init__(self, doc, label, tokenizer):
-            super(KOBERTClassifyDataset, self).__init__()
-            self.doc = doc
-            self.tokenizer = tokenizer
-            self.tokenized = [self.tokenizer([d]) for d in doc] # numpy.array
-            self.label = label
-
-        def gen_attention_mask(self, token_ids, valid_length):
-            attention_mask = np.zeros_like(token_ids)
-            attention_mask[:valid_length] = 1
-            return attention_mask
-
-        def __getitem__(self, i):
-            token_ids = self.tokenized[i][0]
-            valid_length = self.tokenized[i][1]
-            token_type_ids = self.tokenized[i][2]
-            attention_mask = self.gen_attention_mask(token_ids, valid_length)
-            return (token_ids, # numpy.array
-                    attention_mask, # numpy.array
-                    token_type_ids, # numpy.array
-                    self.label[i]) # int scalar
-            # numpy array will be changed to torch.tensor via DataLoader
-
-        def __len__(self):
-            return (len(self.label))
-    
-    bert, bert_vocab = get_pytorch_kobert_model()
-    bert_tokenizer_path = get_tokenizer()
-    bert_tokenizer = nlp.data.BERTSPTokenizer(bert_tokenizer_path, bert_vocab, lower=False)
-    bert_transform = nlp.data.BERTSentenceTransform(
-                bert_tokenizer, max_seq_length=args.max_len, pad=True, pair=False) 
-
-    for sub_train, sub_valid in tqdm(zip(sub_train_list[:n_bert], sub_valid_list[:n_bert]),
-                                    total=n_bert):
-        train_set = KOBERTClassifyDataset(sub_train['text'].tolist(),
-                                         sub_train['label'].tolist(),
-                                         bert_transform)
-        valid_set = KOBERTClassifyDataset(sub_valid['text'].tolist(),
-                                         sub_valid['label'].tolist(),
-                                         bert_transform)
-        train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=args.workers,
-                                  shuffle=True, pin_memory=False)
-        valid_loader = DataLoader(valid_set, batch_size=args.batch_size, num_workers=args.workers,
-                                 shuffle=False, pin_memory=False)
-        train_loaders.append(train_loader)
-        valid_loaders.append(valid_loader)
-            
-        # gpt Data Loaders
-    class KOGPT2ClassifyDataset(Dataset):
-        def __init__(self, doc, label, tokenizer, max_len):
-            super(KOGPT2ClassifyDataset, self).__init__()
-            self.doc = doc
-            self.label = label
-            self.tokenizer = tokenizer
-            self.max_len = max_len
-            self.tokenized = self.tokenizer(doc, padding='max_length', max_length=max_len, truncation=True, return_tensors='pt')
-
-        def __len__(self):
-            return len(self.label)
-
-        def __getitem__(self, idx):
-            return (self.tokenized.input_ids[idx],
-                    self.tokenized.attention_mask[idx],
-                    self.tokenized.token_type_ids[idx],
-                    self.label[idx])
-    
-    gpt_tokenizer = PreTrainedTokenizerFast.from_pretrained(
-            'skt/kogpt2-base-v2',
-            bos_token='</s>', eos_token='</s>', unk_token='<unk>',
-            pad_token='<pad>', mask_token='<mask>')
-    for sub_train, sub_valid in tqdm(zip(sub_train_list[-n_gpt:], sub_valid_list[-n_gpt:]),
-                                    total=n_gpt):
-        train_set = KOGPT2ClassifyDataset(sub_train['text'].tolist(),
-                                         sub_train['label'].tolist(),
-                                         gpt_tokenizer, args.max_len)
-        valid_set = KOGPT2ClassifyDataset(sub_valid['text'].tolist(),
-                                         sub_valid['label'].tolist(),
-                                         gpt_tokenizer, args.max_len)
-        train_loader = DataLoader(train_set, batch_size=args.batch_size, num_workers=args.workers,
-                                  shuffle=True, pin_memory=False)
-        valid_loader = DataLoader(valid_set, batch_size=args.batch_size, num_workers=args.workers,
-                                 shuffle=False, pin_memory=False)
-        train_loaders.append(train_loader)
-        valid_loaders.append(valid_loader)
-            
-            
-    # Build Base Models
-    class KOBERTClassifier(nn.Module):
-        def __init__(self, bert, num_classes, hidden_size = 4026, dr_rate=None, params=None):
-            super(KOBERTClassifier, self).__init__()
-            self.bert = bert
-            self.num_classes = num_classes
-            self.dr_rate = dr_rate
-
-    #         self.classifier = nn.Linear(hidden_size , num_classes)
-            self.classifier = nn.Sequential(nn.Linear(768, hidden_size, bias=True),
-                                            nn.ReLU(),
-                                            nn.Linear(hidden_size, num_classes, bias=True))
-            if dr_rate:
-                self.dropout = nn.Dropout(p=dr_rate)
-
-        def forward(self, token_ids, attention_mask, token_type_ids):
-            _, pooler = self.bert(input_ids=token_ids.long(),
-                                  token_type_ids=token_type_ids.long(),
-                                  attention_mask=attention_mask.float())
-            if self.dr_rate:
-                pooler = self.dropout(pooler)
-            return self.classifier(pooler)
-
-    class KOGPT2Classifier(nn.Module):
-        def __init__(self, gpt, num_classes, hidden_size=4026, freeze_gpt=True, dr_rate=None):
-            super(KOGPT2Classifier, self).__init__()
-            self.gpt = gpt
-            self.num_classes = num_classes
-            self.hidden_size = hidden_size
-            self.freeze_gpt = freeze_gpt
-            self.dr_rate = dr_rate
-
-            # classifier
-            self.classifier = nn.Sequential(nn.Linear(768, hidden_size, bias=True, dtype=torch.float32),
-                                            nn.ReLU(),
-                                            nn.Linear(hidden_size, num_classes, bias=True, dtype=torch.float32))
-
-            if self.dr_rate:
-                self.dropout = nn.Dropout(p=dr_rate)
-
-        def forward(self, token_ids, attention_mask, token_type_ids):
-            # transformer decoder output
-            # size : (b, n_dec_seq, n_hidden)
-            dec_output = self.gpt.transformer(input_ids=token_ids,
-                                      token_type_ids=token_type_ids,
-                                      attention_mask = attention_mask)
-
-            # language model output
-            # size : (b, n_dec_seq, n_dec_vocab)
-            logits_lm = self.gpt.lm_head(dec_output.last_hidden_state)
-
-            # classifier output
-            # size : (b, n_hidden)
-            dec_outputs = dec_output.last_hidden_state[:, -1].contiguous() # 마지막 예측 토큰을 분류값으로 사용
-            # size : (b, num_classes)
-            logits_cls = self.classifier(dec_outputs)
-
-    #         return logits_lm[:, :-1, :].contiguous(), logits_cls, dec_output.attentions
-            return logits_cls
-    
-    if n_gpt:
-        gpt = GPT2LMHeadModel.from_pretrained(
-            pretrained_model_name_or_path='skt/kogpt2-base-v2',
-            pad_token_id=gpt_tokenizer.eos_token_id, torch_dtype='auto',
-            low_cpu_mem_usage=True)
-
-        for child in gpt.children():
-            for param in child.parameters():
-                param.requires_grad = False
-    
-    def get_optimizer(optimizer_type, model, lr, betas, weight_decay, eps=1e-08, amsgrad=False):
-        if optimizer_type == 'AdamW':
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad)
-        elif optimizer_type == 'Adam':
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad)
-        elif optimizer_type == 'RAdam':
-            optimizer = torch.optim.RAdam(model.parameters(), lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad)
-        else:
-            raise
-        return optimizer
-
-    def get_loss(loss_type, **kwargs):
-        if loss_type == 'CE':
-            criterion = CrossEntropy(**kwargs)
-        elif loss_type == 'FCE':
-            criterion = FocalCrossEntropy(**kwargs)
-        else:
-            raise
-        return criterion
+    for model_type, (num, i) in args.num_base_models.items():
+        if num:
+            backbone, tokenizer = load_backbone_tokenizer(model_type, max_len=args.max_len)
+            backbones[model_type] = backbone
+            tokenizers[f'{model_type}_tokenizer'] = tokenizer
+            for sub_train, sub_valid in zip(sub_train_list[i-num:i], sub_valid_list[i-num:i]):
+                train_set = load_dataset(model_type, sub_train['text'].tolist(), sub_train['label'].tolist(),
+                                         tokenizer, max_len=args.max_len)
+                valid_set = load_dataset(model_type, sub_valid['text'].tolist(), sub_valid['label'].tolist(),
+                                         tokenizer, max_len=args.max_len)
+                train_loaders.append(DataLoader(train_set, batch_size=args.batch_size, num_workers=args.workers,
+                                      shuffle=True, pin_memory=False))
+                valid_loaders.append(DataLoader(valid_set, batch_size=args.batch_size, num_workers=args.workers,
+                                     shuffle=False, pin_memory=False))
+    for model_type, (num, i) in args.num_base_models.items():
+        logger.info(f'{model_type} base model {num}개')
     
     # Train!
-    base_models= []
+    base_models = []
+    
     num_classes = len(cat2id)
     for e in range(args.estimators):
         patience = 0 # early stop patience
         model_args = copy(args) # config for {e}th model
         model_args.project = args.project / f'model{e}' # runs/train/exp00/model{e}
         create_directory(model_args.project / 'weights') # runs/train/exp00/model{e}/weights
-        logger.info(f'Start Training Model{e}')
+        
         
         # dataset
         train_loader = train_loaders[e]
@@ -465,12 +158,21 @@ def main(args):
         logger.info(f'# valid data: {len(valid_loader.dataset)}')
 
         # build model
-        if e < n_bert:
-            model_args.model = 'kobert'
-            model = KOBERTClassifier(bert=bert, num_classes=num_classes)
-        else:
-            model_args.model = 'kogpt2'
-            model = KOGPT2Classifier(gpt=gpt, num_classes=num_classes)
+        for model_type, (num, acm_num) in args.num_base_models.items():
+            if e <= acm_num-1:
+                model_args.model = model_type
+                break
+            else:
+                continue
+        model = load_model(model_type=model_args.model,
+                           backbone=copy(backbones[model_args.model]),
+                           num_classes=num_classes,
+                           num_layers=args.n_layers, 
+                           dr_rate=args.dr_rate,
+                           bias=True,
+                           batchnorm=args.batchnorm,
+                           layernorm=args.layernorm)
+        
         model = model.to(args.device)
 
         # save config
@@ -483,93 +185,90 @@ def main(args):
                                   (args.beta1, args.beta2), args.weight_decay, eps=1e-08, amsgrad=False)
 
         # lr scheduler
-        t_total = len(train_loader) * args.epochs
+        max_iter = len(train_loader) * args.epochs
+        num_warmup_step = (max_iter * args.warmup_ratio)
         scheduler = get_scheduler(name=args.lr_scheduler, optimizer=optimizer, 
-                                  num_warmup_steps=args.warmup_step, num_training_steps=t_total)\
+                                  num_warmup_steps=num_warmup_step, num_training_steps=max_iter)
 
-        criterion = get_loss(args.loss)
-
+        if args.loss != 'mix':
+            criterion = get_loss(args.loss)
+        else:
+            n_models = eval(f'args.n_{model_args.model}')
+            
+            before_num_acm = 0
+            for model_type, (n, num_acm) in args.num_base_models.items():
+                if model_type == model_args.model:
+                    ith = n-(num_acm-e)
+            if ith%2==1:
+                criterion = get_loss('FCE')
+            else:
+                criterion = get_loss('ICE')
+        
+        logger.info(f'Start Training Model{e} {model_args.model}')
         best_acc = None
         best_loss = None
         for epoch in range(args.epochs):
+            eval_train = Evaluator(num_classes)
+            eval_valid = Evaluator(num_classes)
+            
             # train
-            train_loss = 0
             model.train()
-            for (input_ids, attention_mask, token_type_ids, label) in tqdm(train_loader, total=len(train_loader)):
-                input_ids = input_ids.to(args.device, non_blocking=True)
-                attention_mask = attention_mask.to(args.device, non_blocking=True)
-                token_type_ids = token_type_ids.to(args.device, non_blocking=True)
-
-                # forward propagation
-                output = model(input_ids, attention_mask, token_type_ids)
+            for inputs, label in tqdm(train_loader, total=len(train_loader)):
+                for k, v in inputs.items():
+                    inputs[k] = v.to(args.device, non_blocking=True).long()
+                    
+                # forward
+                try:
+                    output = model(**inputs)
+                except:
+                    import pdb
+                    pdb.set_trace()
+                    output = model(**inputs)
                 target = label2target(output, label).to(args.device, non_blocking=True)
-                loss = criterion(output, target)
+                loss = criterion(output, target, softmax=True)
 
-                # backward propagation
+                # backward
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                 optimizer.step()
                 scheduler.step()  # Update learning rate schedule
-
-                train_loss += float(loss)*len(label)
-            train_loss /= len(train_loader.dataset)
-
+                
+                # update score
+                pred = output.argmax(1)
+                eval_train.update(pred.tolist(), label.tolist(), loss=float(loss)*len(label))
+            
             # validation
-            valid_loss = 0
-            class_scores = defaultdict(list)
-            predictions = []
-            valid_confusion_matrix = np.zeros((model.num_classes, model.num_classes), dtype=np.int64)
-
             model.eval()
             with torch.no_grad():
-                for (input_ids, attention_mask, token_type_ids, label) in tqdm(valid_loader, total=len(valid_loader)):
-                    input_ids = input_ids.to(args.device, non_blocking=True)
-                    attention_mask = attention_mask.to(args.device, non_blocking=True)
-                    token_type_ids = token_type_ids.to(args.device, non_blocking=True)
-
-                    # forward propagation
-                    output = model(input_ids, attention_mask, token_type_ids)
+                for inputs, label in tqdm(valid_loader, total=len(valid_loader)):
+                    for k, v in inputs.items():
+                        inputs[k] = v.to(args.device, non_blocking=True).long()
+                        
+                    # forward
+                    output = model(**inputs)
                     target = label2target(output, label).to(args.device, non_blocking=True)
-                    loss = criterion(output, target)
-                    valid_loss += float(loss)*len(label)
+                    loss = criterion(output, target, softmax=True)
 
-
-                    # get confusion matrix
+                    # update score
                     pred = torch.argmax(output, 1).cpu()
-                    valid_confusion_matrix += confusion_matrix(label, pred, labels=list(range(model.num_classes)))
-                    predictions += pred.tolist()
-
-                valid_loss /= len(valid_loader.dataset)
-                acc = np.diagonal(valid_confusion_matrix).sum() / valid_confusion_matrix.sum()
-                for c in range(len(valid_confusion_matrix)):
-                    num_pred = valid_confusion_matrix[:, c].sum()
-                    num_true = valid_confusion_matrix[c].sum()
-                    TP = valid_confusion_matrix[c, c]
-                    FP = num_true - TP
-                    FN = num_pred - TP
-                    PC = TP/num_pred if num_pred != 0 else 0 # TP / (TP+FP)
-                    RC = TP/num_true if num_true != 0 else 0  # TP / (TP+FN)
-                    F1 = 2 * PC * RC / (PC + RC) if PC + RC != 0 else 0 # (2 * PC * RC) / (PC + RC)
-                    class_scores['class_id'].append(c)
-                    class_scores['precision'].append(PC)
-                    class_scores['recall'].append(RC)
-                    class_scores['f1score'].append(F1)
-
+                    eval_valid.update(pred.tolist(), label.tolist(), loss=float(loss)*len(label))
+                    
+            eval_train.compute()
+            eval_valid.compute()
+            
             # logging scores
-            macro_pc = statistics.mean(class_scores['precision'])
-            macro_rc = statistics.mean(class_scores['recall'])
-            macro_f1 = statistics.mean(class_scores['f1score'])
-            logger.info(f'Epoch {epoch} Result')
-            logger.info(f'\ttrain loss: {train_loss}\tvalid_loss: {valid_loss}')
-            logger.info(f'\tacc: {round(acc, 6)}\tpc: {round(macro_pc, 6)}\trc: {round(macro_rc, 6)}\tf1: {round(macro_f1, 6)}')
+            logger.info(f'Model {e}/{args.estimators-1} {model_args.model} | Epoch {epoch} Result')
+            logger.info(f'\ttrain | loss: {eval_train.loss}\tacc: {round(eval_train.acc, 6)}\tpc: {round(eval_train.macro_pc, 6)}\trc: {round(eval_train.macro_rc, 6)}\tf1: {round(eval_train.macro_f1, 6)}')
+            logger.info(f'\tvalid | loss: {eval_valid.loss}\tacc: {round(eval_valid.acc, 6)}\tpc: {round(eval_valid.macro_pc, 6)}\trc: {round(eval_valid.macro_rc, 6)}\tf1: {round(eval_valid.macro_f1, 6)}')
 
             # save scores
             if epoch==0:
                 # summary.csv
                 with open(model_args.project / 'summary.csv', 'w', newline='') as f:
                     wr = csv.writer(f)
-                    wr.writerow(['epoch', 'train loss', 'valid loss', 'accuracy', 'precision', 'recall', 'f1score'])
+                    wr.writerow(['epoch', 'train loss', 'train acc', 'train pc', 'train rc', 'train f1',
+                                          'valid loss', 'valid acc', 'valid pc', 'valid rc', 'valid f1'])
                 # base frame for precisions, recalls and f1scores
                 class_id = list(set(train_loader.dataset.label))
                 num_train_data, num_valid_data = [0] * len(class_id), [0] * len(class_id)
@@ -577,7 +276,13 @@ def main(args):
                     num_train_data[c_id] = n
                 for c_id, n in dict(Counter(valid_loader.dataset.label)).items():
                     num_valid_data[c_id] = n
-                history_frame = defaultdict(lambda: pd.DataFrame({
+                history_train = defaultdict(lambda: pd.DataFrame({
+                    'class_id': class_id,
+                    'class': list(map(lambda x: ''.join(id2cat[x]), class_id)),
+                    '# train data' : num_train_data,
+                    '# valid data' : num_valid_data
+                }))
+                history_valid = defaultdict(lambda: pd.DataFrame({
                     'class_id': class_id,
                     'class': list(map(lambda x: ''.join(id2cat[x]), class_id)),
                     '# train data' : num_train_data,
@@ -587,55 +292,64 @@ def main(args):
             # add new line to summary.csv
             with open(model_args.project / 'summary.csv', 'a', newline='') as f:
                 wr = csv.writer(f)
-                wr.writerow([epoch, train_loss, valid_loss, acc, macro_pc, macro_rc, macro_f1])
+                wr.writerow([epoch, eval_train.loss, eval_train.acc, eval_train.macro_pc, eval_train.macro_rc, eval_train.macro_f1,
+                                    eval_valid.loss, eval_valid.acc, eval_valid.macro_pc, eval_valid.macro_rc, eval_valid.macro_f1])
 
             # add new column(epoch) to precision.csv, recall.csv and f1score.csv
-            for metric, values in class_scores.items():
+            for metric, values in eval_train.class_scores.items():
                 if metric != 'class_id':
-                    history_frame[metric][f'epoch {epoch}'] = 0
-                    for c_id, v in zip(class_scores['class_id'], values):
-                        r = history_frame[metric][history_frame[metric]['class_id']==c_id][f'epoch {epoch}'].index
-                        history_frame[metric].loc[r, f'epoch {epoch}'] = v
-                    history_frame[metric].to_csv(model_args.project / f'{metric}.csv', encoding='utf-8-sig', index=False)
+                    history_train[metric][f'epoch {epoch}'] = 0
+                    for c_id, v in zip(eval_valid.class_scores['class_id'], values):
+                        r = history_train[metric][history_train[metric]['class_id']==c_id][f'epoch {epoch}'].index
+                        history_train[metric].loc[r, f'epoch {epoch}'] = v
+                    history_train[metric].to_csv(model_args.project / f'{metric}_train.csv', encoding='utf-8-sig', index=False)
+            
+            # add new column(epoch) to precision.csv, recall.csv and f1score.csv
+            for metric, values in eval_valid.class_scores.items():
+                if metric != 'class_id':
+                    history_valid[metric][f'epoch {epoch}'] = 0
+                    for c_id, v in zip(eval_valid.class_scores['class_id'], values):
+                        r = history_valid[metric][history_valid[metric]['class_id']==c_id][f'epoch {epoch}'].index
+                        history_valid[metric].loc[r, f'epoch {epoch}'] = v
+                    history_valid[metric].to_csv(model_args.project / f'{metric}_valid.csv', encoding='utf-8-sig', index=False)
 
             # save performance graph
             save_performance_graph(model_args.project / 'summary.csv', model_args.project / 'performance.png')
 
             # model save
-            epoch_score = acc
-            torch.save({'state_dict': model.classifier.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'scheduler': scheduler.state_dict(),
-                        'best acc': acc if best_acc is None or acc > best_acc else best_acc,
-                        'best loss': valid_loss if best_loss is None or valid_loss <= best_loss else best_loss,
-                        'epoch': epoch},
-                       model_args.project / 'weights' / 'checkpoint.pth.tar')
+#             if best_acc is None or eval_valid.acc > best_acc: 
+#                 logger.info(f'Validation accuracy got better {best_acc} --> {eval_valid.acc}.  Saving model ...')
+#                 shutil.copyfile(model_args.project / 'weights' / 'checkpoint.pth.tar',
+#                                 model_args.project / 'weights' / 'best_acc.pth.tar')
+#                 best_acc = eval_valid.acc
 
-            if best_acc is None or acc > best_acc: 
-                logger.info(f'Validation accuracy got better {best_acc} --> {acc}.  Saving model ...')
-                shutil.copyfile(model_args.project / 'weights' / 'checkpoint.pth.tar',
-                                model_args.project / 'weights' / 'best_acc.pth.tar')
-                best_acc = acc
+#                 # save valid predictions
+#                 pred_frame = pd.DataFrame({
+#                     "doc": valid_loader.dataset.doc,
+#                     "category": list(map(lambda x: ''.join(id2cat[x]), valid_loader.dataset.label)),
+#                     "predictions": list(map(lambda x: ''.join(id2cat[x]), eval_valid.predictions))
+#                 })
+#                 pred_frame.to_csv(model_args.project / 'best_acc_predictions.csv', encoding='utf-8-sig', index=False)
+#                 del pred_frame
+                
+            if best_loss is None or eval_valid.loss <= best_loss:
+                logger.info(f'Validation loss got better {best_loss} --> {eval_valid.loss}.  Saving model ...')
+                torch.save({'state_dict': model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'scheduler': scheduler.state_dict(),
+                            'best acc': eval_valid.acc if best_acc is None or eval_valid.acc > best_acc else best_acc,
+                            'best loss': eval_valid.loss if best_loss is None or eval_valid.loss <= best_loss else best_loss,
+                            'epoch': epoch},
+                           model_args.project / 'weights' / 'best_loss.pth.tar')
+#                 shutil.copyfile(model_args.project / 'weights' / 'checkpoint.pth.tar',
+#                                 model_args.project / 'weights' / 'best_loss.pth.tar')
+                best_loss = eval_valid.loss
 
                 # save valid predictions
                 pred_frame = pd.DataFrame({
                     "doc": valid_loader.dataset.doc,
                     "category": list(map(lambda x: ''.join(id2cat[x]), valid_loader.dataset.label)),
-                    "predictions": list(map(lambda x: ''.join(id2cat[x]), predictions))
-                })
-                pred_frame.to_csv(model_args.project / 'best_acc_predictions.csv', encoding='utf-8-sig', index=False)
-
-            if best_loss is None or valid_loss <= best_loss:
-                logger.info(f'Validation loss got better {best_loss} --> {valid_loss}.  Saving model ...')
-                shutil.copyfile(model_args.project / 'weights' / 'checkpoint.pth.tar',
-                                model_args.project / 'weights' / 'best_loss.pth.tar')
-                best_loss = valid_loss
-
-                # save valid predictions
-                pred_frame = pd.DataFrame({
-                    "doc": valid_loader.dataset.doc,
-                    "category": list(map(lambda x: ''.join(id2cat[x]), valid_loader.dataset.label)),
-                    "predictions": list(map(lambda x: ''.join(id2cat[x]), predictions))
+                    "predictions": list(map(lambda x: ''.join(id2cat[x]), eval_valid.predictions))
                 })
                 pred_frame.to_csv(model_args.project / 'best_loss_predictions.csv', encoding='utf-8-sig', index=False)
                 patience = 0
@@ -647,218 +361,157 @@ def main(args):
             if patience >= args.patience:
                 logger.info('Early Stop!')
                 break
-            del class_scores, predictions
-        base_models.append(copy(model.classifier))
-        del history_frame
+        model = model.to('cpu')
+        del model
+#         base_models.append(deepcopy(model.classifier))
         
-    # Build Ensemble Model
-    class EnsembleClassifier(nn.Module):
-        def __init__(self, num_classes,
-                     bert=None,
-                     gpt=None,
-                     bert_classifiers=[],
-                     gpt_classifiers=[],
-                     aggregation='mean_softmax',
-                     stacking=None
-                    ):
-            super(EnsembleClassifier, self).__init__()
-            assert (bert is not None) == (len(bert_classifiers)!=0),\
-                'expect both of bert and bert_classifiers, but get one of them'
-            assert (gpt is not None) == (len(gpt_classifiers)!=0),\
-                'expect both of gpt and gpt_classifiers, but get one of them'
-            self.num_classes=num_classes
-            self.bert=bert
-            self.gpt=gpt
-            self.bert_classifiers=bert_classifiers
-            self.gpt_classifiers=gpt_classifiers
-            self.aggregation=aggregation
-            if aggregation=='mean_softmax':
-                self.aggregation_fn=self.mean_softmax
-            elif aggregation=='sum_argmax':
-                self.aggregation_fn=self.sum_argmax
-
-            for child in self.bert.children():
-                for param in child.parameters():
-                    param.requires_grad = False
-
-            for child in self.gpt.children():
-                for param in child.parameters():
-                    param.requires_grad = False
-
-        def mean_softmax(self, tensor, dim=1):
-            return tensor.mean(dim)
-
-        def sum_argmax(self, tensor, dim=1):
-            max_idx = torch.argmax(tensor, dim, keepdim=True)
-            one_hot = torch.FloatTensor(tensor.shape)
-            one_hot.zero_()
-            one_hot.scatter_(dim, max_idx, 1)
-            return one_hot
-
-
-        def forward(self, token_ids, attention_mask, token_type_ids):
-            output = []
-            # bert output
-            if self.bert:
-                _, pooler = self.bert(input_ids=token_ids.long()[:,0].clone(),
-                                      token_type_ids=token_type_ids.long()[:,0].clone(),
-                                      attention_mask=attention_mask.float()[:,0].clone())
-                output += [
-                    F.softmax(classifier(pooler), dim=1) for classifier in self.bert_classifiers
-                ]
-
-            if self.gpt:
-                dec_output = self.gpt.transformer(input_ids=token_ids[:,1],
-                                          token_type_ids=token_type_ids[:,1],
-                                          attention_mask = attention_mask[:,1])
-                dec_outputs = dec_output.last_hidden_state[:, -1].contiguous() # 마지막 예측 토큰을 분류값으로 사용
-                output +=  [
-                    F.softmax(classifier(pooler), dim=1) for classifier in self.gpt_classifiers
-                ]
-
-            output = torch.cat([op.unsqueeze(1) for op in output], dim=1)
-            aggregated = self.aggregation_fn(output)
-            return aggregated
-
-    bert_classifiers = base_models[:n_bert]
-    gpt_classfiers = base_models[n_bert:]
-    ensemble = EnsembleClassifier(num_classes,
-                                 bert=bert if n_bert else None,
-                                 gpt=gpt if n_gpt else None,
-                                 bert_classifiers=bert_classifiers,
-                                 gpt_classifiers=gpt_classifiers,
-                                 aggregation='mean_softmax',
-                                 stacking=None)
+    
+    # Ensemble
+    # Load Base Models
+    base_models = defaultdict(list)
+    for e in range(args.estimators):
+        model_path = args.project / f'model{e}' / 'weights' / 'best_loss.pth.tar'
+        config_path = args.project / f'model{e}' / 'config.json'
+        with open(config_path, 'r', encoding='utf-8-sig') as f:
+            model_args = json.load(f)
+        model = load_model(model_type=model_args['model'],
+                           backbone=copy(backbones[model_args['model']]),
+                           num_classes=num_classes,
+                           num_layers=model_args['n_layers'], 
+                           dr_rate=model_args['dr_rate'],
+                           bias=True,
+                           batchnorm=model_args['batchnorm'],
+                           layernorm=model_args['layernorm'])
+        try:
+            model.load_state_dict(torch.load(model_path, map_location='cpu')['state_dict'])
+        except:
+            import pdb
+            pdb.set_trace()
+            model.load_state_dict(torch.load(model_path, map_location='cpu')['state_dict'])
+        model.eval()
+        base_models[model_args['model']].append(copy(model))
+        
+    
+    # Build Model
+#     ensemble = EnsembleClassifier(num_classes, )
+#                                   kobert=kobert if args.n_kobert else None,
+#                                   kogpt2=kogpt2 if args.n_kogpt2 else None,
+#                                   kobert_classifiers=base_models[:args.n_kobert],
+#                                   kogpt2_classifiers=base_models[args.n_kobert:args.n_kobert+args.n_kogpt2])
     
     # Ensemble Data Loader
-    class EnsembleDataset(Dataset):
-        def __init__(self, doc, label, kobert_tokenizer=None, kogpt_tokenizer=None,
-                     max_len=50, padding='max_length', truncation=True):
-            super(EnsembleDataset, self).__init__()
-    #         assert (kobert_tokenizer==None) and (kogpt_tokenizer==None),\
-    #                 'expect at least one of kobert and kogpt tokenizer, but get neither'
-            self.doc = doc
-            self.label = label
-            self.kobert_tokenizer = kobert_tokenizer
-            self.kogpt_tokenizer = kogpt_tokenizer
-            self.kobert_tokenized = [self.kobert_tokenizer([d]) for d in doc]
-            self.kogpt_toknized = self.kogpt_tokenizer(doc, padding=padding, max_length=max_len, truncation=truncation, return_tensors='pt')
-
-        def gen_attention_mask(self, token_ids, valid_length):
-            attention_mask = np.zeros_like(token_ids)
-            attention_mask[:valid_length] = 1
-            return attention_mask
-
-        def __getitem__(self, idx):
-            kobert_token_ids, kobert_valid_length, kobert_token_type_ids = self.kobert_tokenized[idx]
-            kobert_attention_mask = self.gen_attention_mask(kobert_token_ids, kobert_valid_length)
-
-            kogpt_token_ids = self.kogpt_toknized.input_ids[idx]
-            kogpt_attention_mask = self.kogpt_toknized.attention_mask[idx]
-            kogpt_token_type_ids = self.kogpt_toknized.token_type_ids[idx]
-
-            return (torch.cat([torch.from_numpy(kobert_token_ids).unsqueeze(0), kogpt_token_ids.unsqueeze(0)], dim=0), # token_ids
-                    torch.cat([torch.from_numpy(kobert_attention_mask).unsqueeze(0), kogpt_attention_mask.unsqueeze(0)], dim=0), # attention_mask
-                    torch.cat([torch.from_numpy(kobert_token_type_ids).unsqueeze(0), kogpt_token_type_ids.unsqueeze(0)], dim=0), # token_type_ids
-                    self.label[idx]) # int scalar
-
-        def __len__(self):
-            return (len(self.label))
-
-    test_set = EnsembleDataset(test['text'].tolist(), test['label'].tolist(),
-                              kobert_tokenizer=bert_transform, kogpt_tokenizer=gpt_tokenizer,
-                              max_len=args.max_len)
+    test_set = EnsembleDataset(test['text'].tolist(), test['label'].tolist(), **tokenizers,
+#                                kobert_tokenizer=kobert_transform if args.n_kobert else None,
+#                                kogpt2_tokenizer=kogpt2_tokenizer if args.n_kogpt2 else None,
+                               #mlbert_tokenizer=None, # mlbert_tokenizer if args.n_mlbert else None,
+                               max_len=args.max_len)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, num_workers=args.workers,
                              shuffle=False, pin_memory=False)
-        
     
     # Test Ensemble
+    eval_mean = Evaluator(num_classes)
+    eval_vote = Evaluator(num_classes)
+    eval_base_models = [Evaluator(num_classes) for e in range(args.estimators)]
+    
     logger.info('Start Test Ensemble')
-
-    ensemble = ensemble.to(args.device)
-    ensemble.eval()
-    test_loss = 0
-    class_scores = defaultdict(list)
-    predictions = []
-    test_confusion_matrix = np.zeros((ensemble.num_classes, ensemble.num_classes), dtype=np.int64)
-
-    ensemble.eval()
     with torch.no_grad():
-        for (input_ids, attention_mask, token_type_ids, label) in tqdm(test_loader, total=len(test_loader)):
-            input_ids = input_ids.to(args.device, non_blocking=True)
-            attention_mask = attention_mask.to(args.device, non_blocking=True)
-            token_type_ids = token_type_ids.to(args.device, non_blocking=True)
-
+        for inputs, label in tqdm(test_loader, total=len(test_loader)):
             # forward propagation
-            output = ensemble(input_ids, attention_mask, token_type_ids)
-            target = label2target(output, label).to(args.device, non_blocking=True)
-            loss = criterion(output, target)
-            test_loss += float(loss)*len(label)
-
-
-            # get confusion matrix
-            pred = torch.argmax(output, 1).cpu()
-            test_confusion_matrix += confusion_matrix(label, pred, labels=list(range(ensemble.num_classes)))
-            predictions += pred.tolist()
-
-        test_loss /= len(test_loader.dataset)
-        acc = np.diagonal(test_confusion_matrix).sum() / test_confusion_matrix.sum()
-        for c in range(len(test_confusion_matrix)):
-            num_pred = test_confusion_matrix[:, c].sum()
-            num_true = test_confusion_matrix[c].sum()
-            TP = test_confusion_matrix[c, c]
-            FP = num_true - TP
-            FN = num_pred - TP
-            PC = TP/num_pred if num_pred != 0 else 0 # TP / (TP+FP)
-            RC = TP/num_true if num_true != 0 else 0  # TP / (TP+FN)
-            F1 = 2 * PC * RC / (PC + RC) if PC + RC != 0 else 0 # (2 * PC * RC) / (PC + RC)
-            class_scores['class_id'].append(c)
-            class_scores['precision'].append(PC)
-            class_scores['recall'].append(RC)
-            class_scores['f1score'].append(F1)
-
+            base_model_outputs = []
+            for model_type, models in base_models.items():
+                for model in models:
+                    model.to(args.device)
+                    _inputs = {}
+                    _inputs['input_ids'] = inputs[model_type][:, 0].to(args.device, non_blocking=True).long()
+                    _inputs['attention_mask'] = inputs[model_type][:, 1].to(args.device, non_blocking=True).long()
+                    if 'bart' not in model_type:
+                        _inputs['token_type_ids'] = inputs[model_type][:, 2].to(args.device, non_blocking=True).long()
+                    output = model(**_inputs)
+                    pred = F.softmax(output, dim=1)
+                    base_model_outputs.append(pred.cpu())
+            
+            base_model_outputs = torch.stack(base_model_outputs)
+#             base_model_outputs = ensemble(**inputs) # (n_model, n_batch, num_classes)
+            ensemble_output_mean = torch.mean(base_model_outputs, dim=0)
+            ensemble_output_vote = vote(base_model_outputs, dim=2)
+            target = label2target(base_model_outputs[0], label)
+            
+            # update
+            for i, base_model_output in enumerate(base_model_outputs):
+                loss = criterion(base_model_output.cpu(), target, softmax=False)
+                pred_base_model = base_model_output.argmax(1).cpu()
+                eval_base_models[i].update(pred_base_model.tolist(), label.tolist(), loss=float(loss)*len(label))
+            
+            # ensemble result
+            ensemble_loss = criterion(ensemble_output_mean, target, softmax=False)
+            pred_mean = ensemble_output_mean.argmax(1).cpu()
+            pred_vote = ensemble_output_vote.sum(0).argmax(1).cpu()
+            eval_mean.update(pred_mean.tolist(), label.tolist(), loss=float(ensemble_loss)*len(label))
+            eval_vote.update(pred_vote.tolist(), label.tolist())
+            
+        # compute acc, pc, rc, f1
+        for eval_base_model in eval_base_models:
+            eval_base_model.compute()
+        eval_mean.compute()
+        eval_vote.compute()
+        
     # logging scores
-    macro_pc = statistics.mean(class_scores['precision'])
-    macro_rc = statistics.mean(class_scores['recall'])
-    macro_f1 = statistics.mean(class_scores['f1score'])
-    logger.info(f'\ttest_loss: {valid_loss}')
-    logger.info(f'\tacc: {round(acc, 6)}\tpc: {round(macro_pc, 6)}\trc: {round(macro_rc, 6)}\tf1: {round(macro_f1, 6)}')
+        # ensemble
+    logger.info(f'mean agg| loss: {round(eval_mean.loss, 6)}\tacc: {round(eval_mean.acc, 6)}\tpc: {round(eval_mean.macro_pc, 6)}\trc: {round(eval_mean.macro_rc, 6)}\tf1: {round(eval_mean.macro_f1, 6)}')
+    logger.info(f'vote agg| loss: -\tacc: {round(eval_vote.acc, 6)}\tpc: {round(eval_vote.macro_pc, 6)}\trc: {round(eval_vote.macro_rc, 6)}\tf1: {round(eval_vote.macro_f1, 6)}')
+        # base model
+    for e, eval_base_model in enumerate(eval_base_models):
+        logger.info(f'model{e} | \tacc: {round(eval_base_model.acc, 6)}\tpc: {round(eval_base_model.macro_pc, 6)}\trc: {round(eval_base_model.macro_rc, 6)}\tf1: {round(eval_base_model.macro_f1, 6)}')
 
-    # summary.csv
-    with open(args.project / 'test_result.csv', 'w', newline='') as f:
+    # save summary.csv
+    with open(args.project / 'test_summary.csv', 'w', newline='') as f:
         wr = csv.writer(f)
-        wr.writerow(['test_loss', 'accuracy', 'precision', 'recall', 'f1score'])
-    # base frame for precisions, recalls and f1scores
-    class_id = list(set(train_loader.dataset.label))
+        wr.writerow(['agg_fn', 'test_loss', 'accuracy', 'precision', 'recall', 'f1score'])
+        wr.writerow(['mean', eval_mean.loss, eval_mean.acc, eval_mean.macro_pc, eval_mean.macro_rc, eval_mean.macro_f1])
+        wr.writerow(['vote', '-', eval_vote.acc, eval_vote.macro_pc, eval_vote.macro_rc, eval_vote.macro_f1])
+        for e, eval_base_model in enumerate(eval_base_models):
+            wr.writerow([f'model{e}', eval_base_model.loss, eval_base_model.acc, eval_base_model.macro_pc, eval_base_model.macro_rc, eval_base_model.macro_f1])
+            
+    # save precision.csv, recall.csv and f1score.csv
+    class_id = list(set(id2cat.keys()))
     num_test_data = [0] * len(class_id)
     for c_id, n in dict(Counter(test_loader.dataset.label)).items():
         num_test_data[c_id] = n
+
     history_frame = pd.DataFrame({
         'class_id': class_id,
-        'class': list(map(lambda x: ''.join(id2cat[x]), class_id)),
+        'class': [''.join(id2cat[x]) for x in class_id],
         '# test data' : num_test_data
     })
-
-    # add new line to summary.csv
-    with open(args.project / 'test_result.csv', 'a', newline='') as f:
-        wr = csv.writer(f)
-        wr.writerow([test_loss, acc, macro_pc, macro_rc, macro_f1])
-
-    # add new column(epoch) to precision.csv, recall.csv and f1score.csv
-    for metric, values in class_scores.items():
+    for metric, values in eval_mean.class_scores.items():
         if metric != 'class_id':
             history_frame[metric] = 0
-            for c_id, v in zip(class_scores['class_id'], values):
+            for c_id, v in zip(eval_mean.class_scores['class_id'], values):
                 r = history_frame[history_frame['class_id']==c_id][metric].index
-                history_frame[metric].loc[r, metric] = v
-            history_fram.to_csv(args.project / f'test_result_verbose.csv', encoding='utf-8-sig', index=False)
+                history_frame.loc[r, metric] = v
+            history_frame.to_csv(args.project / f'test_result_mean.csv', encoding='utf-8-sig', index=False)
+
+    history_frame = pd.DataFrame({
+        'class_id': class_id,
+        'class': [''.join(id2cat[x]) for x in class_id],
+        '# test data' : num_test_data
+    })
+    for metric, values in eval_vote.class_scores.items():
+        if metric != 'class_id':
+            history_frame[metric] = 0
+            for c_id, v in zip(eval_vote.class_scores['class_id'], values):
+                r = history_frame[history_frame['class_id']==c_id][metric].index
+                history_frame.loc[r, metric] = v
+            history_frame.to_csv(args.project / f'test_result_vote.csv', encoding='utf-8-sig', index=False)
 
     # save valid predictions
     pred_frame = pd.DataFrame({
         "doc": test_loader.dataset.doc,
         "category": list(map(lambda x: ''.join(id2cat[x]), test_loader.dataset.label)),
-        "predictions": list(map(lambda x: ''.join(id2cat[x]), predictions))
+        "pred_mean": list(map(lambda x: ''.join(id2cat[x]), eval_mean.predictions)),
+        "pred_vote": list(map(lambda x: ''.join(id2cat[x]), eval_vote.predictions))
     })
+
     pred_frame.to_csv(args.project / 'predictions.csv', encoding='utf-8-sig', index=False)
     
     
@@ -870,17 +523,28 @@ def get_args():
     
     parser=argparse.ArgumentParser(
         description='Training Disease Recognition in Pet CT')
-    parser.add_argument('--root', default=DATA / '1. 실습용자료_hsp2.txt', type=str,
+    parser.add_argument('--root', default=DATA / '1. 실습용자료_final.txt', type=str,
                     help='data format should be txt, sep="|"')
     parser.add_argument('--project', default=save_dir, type=str)
     
-    # Data
+    # Data Preprocess
     parser.add_argument('--num-test', default=50000, type=int,
                     help='the number of test data')
-    parser.add_argument('--upsample', default='shuffle', type=str,
-                    help='"shuffle", "reproduce", "random"')
+    parser.add_argument('--upsample', default='', type=str,
+                    help='"shuffle", "uniform", "random"')
     parser.add_argument('--minimum', default=100, type=int,
                     help='(upsample) setting the minimum number of data of each categories')
+    parser.add_argument('--num-samples', default=150000, type=int,
+                        help='the number of sampled data.'
+                           'one sub dataset contains {num-samples} data')
+    parser.add_argument('--num-sub-valid', default=50000, type=int,
+                        help='the valid ratio of num-samples will be sub valid data')
+    parser.add_argument('--sample-dist', default='same', type=str,
+                        help='class distributions of sampled sub datasets.'
+                            '"same": same as the distribution of the mother dataset'
+                            '"random": random distribution not considering mother dataset')
+    
+    # Data Loader
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
     parser.add_argument('-b', '--batch-size', default=512, type=int, metavar='N',
@@ -888,21 +552,86 @@ def get_args():
                          '[kobert] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50'
                          '[kogpt2] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50'
                          '[kogpt3] a NVDIA RTX 3090T memory can process 512 batch size where max_len is 50')
-
+    
+    # Model
     parser.add_argument('-m', '--model', default='ensemble', type=str,
-                        help='Model to train. Available models are ["ensemble", "ensemble-kobert", "ensemble-kogpt2"].'
-                            'default is "ensemble".')
-    parser.add_argument('--estimators', default=10, type=int,
-                        help='a number of base models')
-    parser.add_argument('--num-samples', default=150000, type=int,
-                        help='the number of sampled data.'
-                           'one sub dataset contains {num-samples} data')
-    parser.add_argument('--sub-valid-ratio', default=0.1, type=float,
-                        help='the valid ratio of num-samples will be sub valid data')
-    parser.add_argument('--sample-dist', default='same', type=str,
-                        help='class distributions of sampled sub datasets.'
-                            '"same": same as the distribution of the mother dataset'
-                            '"random": random distribution not considering mother dataset')
+                        help='Model to train. Available models are ensemble.')
+    parser.add_argument('--n-kobert', default=0, type=int,
+                        help='a number of kobert base models')
+    parser.add_argument('--n-bert', default=0, type=int,
+                        help='a number of kobert base models')
+    parser.add_argument('--n-mlbert', default=0, type=int,
+                        help='a number of multi-lingual bert base models')
+    parser.add_argument('--n-albert', default=0, type=int,
+                        help='a number of multi-lingual bert base models')
+    parser.add_argument('--n-kobart', default=0, type=int,
+                        help='a number of multi-lingual bert base models')
+    parser.add_argument('--n-asbart', default=0, type=int,
+                        help='a number of multi-lingual bert base models')
+    parser.add_argument('--n-kogpt2', default=0, type=int,
+                        help='a number of kogpt2 base models')
+    parser.add_argument('--n-kogpt3', default=0, type=int,
+                        help='a number of kogpt2 base models')
+    parser.add_argument('--n-electra', default=0, type=int,
+                        help='a number of kogpt2 base models')
+    parser.add_argument('--n-funnel', default=0, type=int,
+                        help='a number of kogpt2 base models')
+    
+#     parser.add_argument('--n-hanbert', default=0, type=int,
+#                         help='a number of hanbert base models')
+#     parser.add_argument('--n-dstbert', default=0, type=int,
+#                         help='a number of dstbert base models')
+#     parser.add_argument('--n-skobert', default=0, type=int,
+#                         help='a number of skobert base models')
+    
+    # n layers
+    parser.add_argument('--dr-rate', default=None, type=float,
+                        help='')
+    parser.add_argument('--n-layers', default=1, type=int,
+                        help='a number of layers to be stacked upen kobert language model.')
+    parser.add_argument('--layernorm', action='store_true',
+                        help='a number of layers to be stacked upen kobert language model.')
+    parser.add_argument('--batchnorm', action='store_true',
+                        help='a number of layers to be stacked upen kobert language model.')
+    
+#     parser.add_argument('--kobert-layers', default=1, type=int,
+#                         help='a number of layers to be stacked upen kobert language model.')
+#     parser.add_argument('--kogpt2-layers', default=1, type=int,
+#                         help='a number of layers to be stacked upen kogpt2 language model.')
+#     parser.add_argument('--mlbert-layers', default=1, type=int,
+#                         help='a number of layers to be stacked upen mlbert language model.')
+#     parser.add_argument('--hanbert-layers', default=1, type=int,
+#                         help='a number of layers to be stacked upen hanbert language model.')
+#     parser.add_argument('--dstbert-layers', default=1, type=int,
+#                         help='a number of layers to be stacked upen dstbert language model.')
+#     parser.add_argument('--skobert-layers', default=1, type=int,
+#                         help='a number of layers to be stacked upen skobert language model.')
+#     # lyaer normalization
+#     parser.add_argument('--kobert-ln', action='store_true',
+#                         help='use layer normalization in a classifier.')
+#     parser.add_argument('--kogpt2-ln', action='store_true',
+#                         help='use layer normalization in a classifier.')
+#     parser.add_argument('--mlbert-ln', action='store_true',
+#                         help='use layer normalization in a classifier.')
+#     parser.add_argument('--hanbert-ln', action='store_true',
+#                         help='use layer normalization in a classifier.')
+#     parser.add_argument('--dstbert-ln', action='store_true',
+#                         help='use layer normalization in a classifier.')
+#     parser.add_argument('--skobert-ln', action='store_true',
+#                         help='use layer normalization in a classifier.')
+#     # batch normalization
+#     parser.add_argument('--kobert-bn', action='store_true',
+#                         help='use batch normalization in a classifier.')
+#     parser.add_argument('--kogpt2-bn', action='store_true',
+#                         help='use batch normalization in a classifier.')
+#     parser.add_argument('--mlbert-bn', action='store_true',
+#                         help='use batch normalization in a classifier.')
+#     parser.add_argument('--hanbert-bn', action='store_true',
+#                         help='use batch normalization in a classifier.')
+#     parser.add_argument('--dstbert-bn', action='store_true',
+#                         help='use batch normalization in a classifier.')
+#     parser.add_argument('--skobert-bn', action='store_true',
+#                         help='use batch normalization in a classifier.')
     
     parser.add_argument('--epochs', default=10, type=int, metavar='N',
                         help='number of total epochs to run')
@@ -917,19 +646,19 @@ def get_args():
                 
     # Loss
     parser.add_argument('--loss', default='FCE', type=str,
-                        help='Loss function. Availabel loss functions are . default is Focal Cross Entropy(FCE).')
+                        help='Loss function. Availabel loss functions are ["CE", "FCE", "ICE", "mix"]. default is Focal Cross Entropy(FCE).')
 
     # Learning rate
     parser.add_argument('-lr', '--learning-rate', default=0.0001, type=float,
                         metavar='LR', help='initial learning rate', dest='lr')
     parser.add_argument('--lr-scheduler', default='cosine_with_restarts',
                         type=str, help='Available schedulers are "linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup')
-    parser.add_argument('--warmup-step', default=1000, type=int, help='lr-scheduler')
+    parser.add_argument('--warmup-ratio', default=0.02, type=int, help='lr-scheduler')
 
     # Optimizer
     parser.add_argument('--optimizer', type=str, default='AdamW',
                         help='default is AdamW')
-    parser.add_argument('--beta1', type=float, default=0.5,
+    parser.add_argument('--beta1', type=float, default=0.9,
                         help='momentum1 in Adam')
     parser.add_argument('--beta2', type=float, default=0.999,
                         help='momentum2 in Adam')
@@ -942,13 +671,43 @@ def get_args():
     parser.add_argument('--device', default='cuda', type=str,
                         help='device to use. "cpu", "cuda", "cuda:0", "cuda:1"')
 
-    parser.add_argument('--seed', default=42, type=int,
+    parser.add_argument('--seed', default=5986, type=int,
                         help='seed for initializing training.')
     parser.add_argument('--max-len', default=50, type=int,
                         help='max sequence length to cut or pad')
 
-
+    
     args=parser.parse_args()
+    args.estimators = sum([args.n_kobert,args.n_bert,args.n_mlbert,args.n_albert,
+                           args.n_kobart,args.n_asbart,
+                           args.n_kogpt2,args.n_kogpt3,
+                           args.n_electra,args.n_funnel])
+    num_base_models = OrderedDict()
+    acc_num=0
+    for model_type, num in zip(['kobert', 'bert', 'mlbert', 'albert',
+                                'kobart', 'asbart',
+                                'kogpt2', 'kogpt3',
+                                'electra', 'funnel'],
+                               [args.n_kobert,args.n_bert,args.n_mlbert,args.n_albert,
+                                args.n_kobart,args.n_asbart,
+                                args.n_kogpt2,args.n_kogpt3,
+                                args.n_electra,args.n_funnel]):
+        acc_num+=num
+        num_base_models[model_type] = (num, acc_num)
+    args.num_base_models = num_base_models
+    for model_type, (num, acm_num) in args.num_base_models.items():
+        print(model_type, (num, acm_num))
+        
+        
+#     args.num_base_models = OrderedDict({name: num for name, num in zip(['kobert', 'bert', 'mlbert', 'albert',
+#                                                                         'kobart', 'asbart',
+#                                                                         'kogpt2', 'kogpt3',
+#                                                                         'electra', 'funnel'],
+#                                                                        [args.n_kobert,args.n_bert,args.n_mlbert,args.n_albert,
+#                                                                         args.n_kobart,args.n_asbart,
+#                                                                         args.n_kogpt2,args.n_kogpt3,
+#                                                                         args.n_electra,args.n_funnel])})
+    assert args.estimators > 0, 'need at least one base model'
     return args
     
 if __name__=='__main__':
