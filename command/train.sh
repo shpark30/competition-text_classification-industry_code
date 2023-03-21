@@ -1,6 +1,5 @@
 #! /bin/bash
 
-# 3월 29일 월요일
 MODEL='kogpt2'
 LOSS='FCE'
 EPOCH=30
