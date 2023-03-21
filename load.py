@@ -110,7 +110,7 @@ def load_backbone_tokenizer(model_type, max_len=50):
         return funnel, funnel_tokenizer
 
     # Not matched
-    raise f"invalid model type, {model_type}"
+    raise Exception(f"invalid model type, {model_type}")
 
 
 def load_model(
@@ -235,7 +235,7 @@ def load_model(
         )
 
     # Not matched
-    raise f"invalid model type, {model_type}"
+    raise Exception(f"invalid model type, {model_type}")
 
 
 def load_dataset(model_type, text, label, tokenizer, max_len=50):
@@ -333,7 +333,7 @@ def load_dataset(model_type, text, label, tokenizer, max_len=50):
         )
 
     # Not matched
-    raise f"invalid model type, {model_type}"
+    raise Exception(f"invalid model type, {model_type}")
 
 
 def load_backbones_tokenizers_classifiers(exp_paths, num_classes=225, device="cpu"):
