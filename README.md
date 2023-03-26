@@ -3,7 +3,7 @@
 상단 PDF에서 자세한 리뷰를 확인할 수 있습니다.
 
 ## Description
-**Competition Link : [통계데이터 인공지능 활용대회 개최](https://data.kostat.go.kr/sbchome/bbs/boardDetail.do)<p>**
+**Competition Link : [통계데이터 인공지능 활용대회]([https://data.kostat.go.kr/sbchome/bbs/boardDetail.do](https://data.kostat.go.kr/sbchome/bbs/boardDetail.do))<p>**
 
 **[주제]**
 
